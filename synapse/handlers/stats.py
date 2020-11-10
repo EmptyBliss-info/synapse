@@ -49,7 +49,7 @@ class StatsHandler:
         # Guard to ensure we only process deltas one at a time
         self._is_processing = False
 
-        if hs.config.stats_enabled:
+        if self.stats_enabled and hs.config.run_background_tasks:
             self.notifier.add_replication_callback(self.notify_new_event)
 
             # We kick this off so that we don't have to wait for a change before
@@ -232,7 +232,7 @@ class StatsHandler:
 
                 if membership == prev_membership:
                     pass  # noop
-                if membership == Membership.JOIN:
+                elif membership == Membership.JOIN:
                     room_stats_delta["joined_members"] += 1
                 elif membership == Membership.INVITE:
                     room_stats_delta["invited_members"] += 1

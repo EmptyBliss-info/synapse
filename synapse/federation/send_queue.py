@@ -37,8 +37,8 @@ from sortedcontainers import SortedDict
 
 from twisted.internet import defer
 
+from synapse.api.presence import UserPresenceState
 from synapse.metrics import LaterGauge
-from synapse.storage.presence import UserPresenceState
 from synapse.util.metrics import Measure
 
 from .units import Edu
@@ -46,7 +46,7 @@ from .units import Edu
 logger = logging.getLogger(__name__)
 
 
-class FederationRemoteSendQueue(object):
+class FederationRemoteSendQueue:
     """A drop in replacement for FederationSender"""
 
     def __init__(self, hs):
@@ -57,7 +57,7 @@ class FederationRemoteSendQueue(object):
 
         # We may have multiple federation sender instances, so we need to track
         # their positions separately.
-        self._sender_instances = hs.config.federation.federation_shard_config.instances
+        self._sender_instances = hs.config.worker.federation_shard_config.instances
         self._sender_positions = {}
 
         # Pending presence map user_id -> UserPresenceState
@@ -188,7 +188,7 @@ class FederationRemoteSendQueue(object):
             for key in keys[:i]:
                 del self.edus[key]
 
-    def notify_new_events(self, current_id):
+    def notify_new_events(self, max_token):
         """As per FederationSender"""
         # We don't need to replicate this as it gets sent down a different
         # stream.
@@ -365,7 +365,7 @@ class FederationRemoteSendQueue(object):
         )
 
 
-class BaseFederationRow(object):
+class BaseFederationRow:
     """Base class for rows to be sent in the federation stream.
 
     Specifies how to identify, serialize and deserialize the different types.

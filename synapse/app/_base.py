@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import gc
 import logging
 import os
@@ -22,7 +21,6 @@ import sys
 import traceback
 from typing import Iterable
 
-from daemonize import Daemonize
 from typing_extensions import NoReturn
 
 from twisted.internet import defer, error, reactor
@@ -30,10 +28,12 @@ from twisted.protocols.tls import TLSMemoryBIOFactory
 
 import synapse
 from synapse.app import check_bind_error
+from synapse.app.phone_stats_home import start_phone_stats_home
 from synapse.config.server import ListenerConfig
 from synapse.crypto import context_factory
 from synapse.logging.context import PreserveLoggingContext
 from synapse.util.async_helpers import Linearizer
+from synapse.util.daemonize import daemonize_process
 from synapse.util.rlimit import change_resource_limit
 from synapse.util.versionstring import get_version_string
 
@@ -49,7 +49,6 @@ def register_sighup(func, *args, **kwargs):
 
     Args:
         func (function): Function to be called when sent a SIGHUP signal.
-            Will be called with a single default argument, the homeserver.
         *args, **kwargs: args and kwargs to be passed to the target function.
     """
     _sighup_callbacks.append((func, args, kwargs))
@@ -129,17 +128,8 @@ def start_reactor(
             if print_pidfile:
                 print(pid_file)
 
-            daemon = Daemonize(
-                app=appname,
-                pid=pid_file,
-                action=run,
-                auto_close_fds=False,
-                verbose=True,
-                logger=logger,
-            )
-            daemon.start()
-        else:
-            run()
+            daemonize_process(pid_file, logger)
+        run()
 
 
 def quit_with_error(error_string: str) -> NoReturn:
@@ -260,13 +250,13 @@ def start(hs: "synapse.server.HomeServer", listeners: Iterable[ListenerConfig]):
                 sdnotify(b"RELOADING=1")
 
                 for i, args, kwargs in _sighup_callbacks:
-                    i(hs, *args, **kwargs)
+                    i(*args, **kwargs)
 
                 sdnotify(b"READY=1")
 
             signal.signal(signal.SIGHUP, handle_sighup)
 
-            register_sighup(refresh_certificate)
+            register_sighup(refresh_certificate, hs)
 
         # Load the certificate from disk.
         refresh_certificate(hs)
@@ -278,11 +268,21 @@ def start(hs: "synapse.server.HomeServer", listeners: Iterable[ListenerConfig]):
 
         # It is now safe to start your Synapse.
         hs.start_listening(listeners)
-        hs.get_datastore().db.start_profiling()
+        hs.get_datastore().db_pool.start_profiling()
         hs.get_pusherpool().start()
+
+        # Log when we start the shut down process.
+        hs.get_reactor().addSystemEventTrigger(
+            "before", "shutdown", logger.info, "Shutting down..."
+        )
 
         setup_sentry(hs)
         setup_sdnotify(hs)
+
+        # If background tasks are running on the main process, start collecting the
+        # phone home stats.
+        if hs.config.run_background_tasks:
+            start_phone_stats_home(hs)
 
         # We now freeze all allocated objects in the hopes that (almost)
         # everything currently allocated are things that will be used for the
@@ -344,6 +344,13 @@ def install_dns_limiter(reactor, max_dns_requests_in_flight=100):
     This is to workaround https://twistedmatrix.com/trac/ticket/9620, where we
     can run out of file descriptors and infinite loop if we attempt to do too
     many DNS queries at once
+
+    XXX: I'm confused by this. reactor.nameResolver does not use twisted.names unless
+    you explicitly install twisted.names as the resolver; rather it uses a GAIResolver
+    backed by the reactor's default threadpool (which is limited to 10 threads). So
+    (a) I don't understand why twisted ticket 9620 is relevant, and (b) I don't
+    understand why we would run out of FDs if we did too many lookups at once.
+    -- richvdh 2020/08/29
     """
     new_resolver = _LimitedHostnameResolver(
         reactor.nameResolver, max_dns_requests_in_flight
@@ -352,7 +359,7 @@ def install_dns_limiter(reactor, max_dns_requests_in_flight=100):
     reactor.installNameResolver(new_resolver)
 
 
-class _LimitedHostnameResolver(object):
+class _LimitedHostnameResolver:
     """Wraps a IHostnameResolver, limiting the number of in-flight DNS lookups.
     """
 
@@ -412,7 +419,7 @@ class _LimitedHostnameResolver(object):
             yield deferred
 
 
-class _DeferredResolutionReceiver(object):
+class _DeferredResolutionReceiver:
     """Wraps a IResolutionReceiver and simply resolves the given deferred when
     resolution is complete
     """

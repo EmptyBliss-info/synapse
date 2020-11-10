@@ -55,6 +55,7 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
             self.hs.config.server_name,
             id="1234",
             namespaces={"users": [{"regex": r"@as_user.*", "exclusive": True}]},
+            sender="@as:test",
         )
 
         self.hs.get_datastore().services_cache.append(appservice)
@@ -116,8 +117,8 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
         self.assertEquals(channel.result["code"], b"200", channel.result)
         self.assertDictContainsSubset(det_data, channel.json_body)
 
+    @override_config({"enable_registration": False})
     def test_POST_disabled_registration(self):
-        self.hs.config.enable_registration = False
         request_data = json.dumps({"username": "kermit", "password": "monkey"})
         self.auth_result = (None, {"username": "kermit", "password": "monkey"}, None)
 
@@ -160,7 +161,7 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
             else:
                 self.assertEquals(channel.result["code"], b"200", channel.result)
 
-        self.reactor.advance(retry_after_ms / 1000.0)
+        self.reactor.advance(retry_after_ms / 1000.0 + 1.0)
 
         request, channel = self.make_request(b"POST", self.url + b"?kind=guest", b"{}")
         self.render(request)
@@ -186,7 +187,7 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
             else:
                 self.assertEquals(channel.result["code"], b"200", channel.result)
 
-        self.reactor.advance(retry_after_ms / 1000.0)
+        self.reactor.advance(retry_after_ms / 1000.0 + 1.0)
 
         request, channel = self.make_request(b"POST", self.url + b"?kind=guest", b"{}")
         self.render(request)

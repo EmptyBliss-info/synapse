@@ -26,9 +26,9 @@ from synapse.replication.http.register import (
     ReplicationPostRegisterActionsServlet,
     ReplicationRegisterServlet,
 )
+from synapse.spam_checker_api import RegistrationBehaviour
 from synapse.storage.state import StateFilter
 from synapse.types import RoomAlias, UserID, create_requester
-from synapse.util.async_helpers import Linearizer
 
 from ._base import BaseHandler
 
@@ -42,23 +42,18 @@ class RegistrationHandler(BaseHandler):
         Args:
             hs (synapse.server.HomeServer):
         """
-        super(RegistrationHandler, self).__init__(hs)
+        super().__init__(hs)
         self.hs = hs
         self.auth = hs.get_auth()
         self._auth_handler = hs.get_auth_handler()
         self.profile_handler = hs.get_profile_handler()
         self.user_directory_handler = hs.get_user_directory_handler()
-        self.identity_handler = self.hs.get_handlers().identity_handler
+        self.identity_handler = self.hs.get_identity_handler()
         self.ratelimiter = hs.get_registration_ratelimiter()
-
-        self._next_generated_user_id = None
-
         self.macaroon_gen = hs.get_macaroon_generator()
-
-        self._generate_user_id_linearizer = Linearizer(
-            name="_generate_user_id_linearizer"
-        )
         self._server_notices_mxid = hs.config.server_notices_mxid
+
+        self.spam_checker = hs.get_spam_checker()
 
         if hs.config.worker_app:
             self._register_client = ReplicationRegisterServlet.make_client(hs)
@@ -120,7 +115,10 @@ class RegistrationHandler(BaseHandler):
                     400, "User ID already taken.", errcode=Codes.USER_IN_USE
                 )
             user_data = await self.auth.get_user_by_access_token(guest_access_token)
-            if not user_data["is_guest"] or user_data["user"].localpart != localpart:
+            if (
+                not user_data.is_guest
+                or UserID.from_string(user_data.user_id).localpart != localpart
+            ):
                 raise AuthError(
                     403,
                     "Cannot register taken user ID without valid guest "
@@ -132,7 +130,9 @@ class RegistrationHandler(BaseHandler):
             try:
                 int(localpart)
                 raise SynapseError(
-                    400, "Numeric user IDs are reserved for guest users."
+                    400,
+                    "Numeric user IDs are reserved for guest users.",
+                    errcode=Codes.INVALID_USERNAME,
                 )
             except ValueError:
                 pass
@@ -150,6 +150,7 @@ class RegistrationHandler(BaseHandler):
         address=None,
         bind_emails=[],
         by_admin=False,
+        user_agent_ips=None,
     ):
         """Registers a new client on the server.
 
@@ -167,12 +168,32 @@ class RegistrationHandler(BaseHandler):
             bind_emails (List[str]): list of emails to bind to this account.
             by_admin (bool): True if this registration is being made via the
               admin api, otherwise False.
+            user_agent_ips (List[(str, str)]): Tuples of IP addresses and user-agents used
+                during the registration process.
         Returns:
             str: user_id
         Raises:
             SynapseError if there was a problem registering.
         """
         self.check_registration_ratelimit(address)
+
+        result = self.spam_checker.check_registration_for_spam(
+            threepid, localpart, user_agent_ips or [],
+        )
+
+        if result == RegistrationBehaviour.DENY:
+            logger.info(
+                "Blocked registration of %r", localpart,
+            )
+            # We return a 429 to make it not obvious that they've been
+            # denied.
+            raise SynapseError(429, "Rate limited")
+
+        shadow_banned = result == RegistrationBehaviour.SHADOW_BAN
+        if shadow_banned:
+            logger.info(
+                "Shadow banning registration of %r", localpart,
+            )
 
         # do not check_auth_blocking if the call is coming through the Admin API
         if not by_admin:
@@ -202,6 +223,7 @@ class RegistrationHandler(BaseHandler):
                 admin=admin,
                 user_type=user_type,
                 address=address,
+                shadow_banned=shadow_banned,
             )
 
             if self.hs.config.user_directory_search_all_users:
@@ -219,7 +241,7 @@ class RegistrationHandler(BaseHandler):
                 if fail_count > 10:
                     raise SynapseError(500, "Unable to find a suitable guest user ID")
 
-                localpart = await self._generate_user_id()
+                localpart = await self.store.generate_user_id()
                 user = UserID(localpart, self.hs.hostname)
                 user_id = user.to_string()
                 self.check_user_id_not_appservice_exclusive(user_id)
@@ -232,6 +254,7 @@ class RegistrationHandler(BaseHandler):
                         make_guest=make_guest,
                         create_profile_with_displayname=default_display_name,
                         address=address,
+                        shadow_banned=shadow_banned,
                     )
 
                     # Successfully registered
@@ -510,18 +533,6 @@ class RegistrationHandler(BaseHandler):
                     errcode=Codes.EXCLUSIVE,
                 )
 
-    async def _generate_user_id(self):
-        if self._next_generated_user_id is None:
-            with await self._generate_user_id_linearizer.queue(()):
-                if self._next_generated_user_id is None:
-                    self._next_generated_user_id = (
-                        await self.store.find_next_generated_user_id_localpart()
-                    )
-
-        id = self._next_generated_user_id
-        self._next_generated_user_id += 1
-        return str(id)
-
     def check_registration_ratelimit(self, address):
         """A simple helper method to check whether the registration rate limit has been hit
         for a given IP address
@@ -549,6 +560,7 @@ class RegistrationHandler(BaseHandler):
         admin=False,
         user_type=None,
         address=None,
+        shadow_banned=False,
     ):
         """Register user in the datastore.
 
@@ -566,9 +578,10 @@ class RegistrationHandler(BaseHandler):
             user_type (str|None): type of user. One of the values from
                 api.constants.UserTypes, or None for a normal user.
             address (str|None): the IP address used to perform the registration.
+            shadow_banned (bool): Whether to shadow-ban the user
 
         Returns:
-            Deferred
+            Awaitable
         """
         if self.hs.config.worker_app:
             return self._register_client(
@@ -581,6 +594,7 @@ class RegistrationHandler(BaseHandler):
                 admin=admin,
                 user_type=user_type,
                 address=address,
+                shadow_banned=shadow_banned,
             )
         else:
             return self.store.register_user(
@@ -592,6 +606,7 @@ class RegistrationHandler(BaseHandler):
                 create_profile_with_displayname=create_profile_with_displayname,
                 admin=admin,
                 user_type=user_type,
+                shadow_banned=shadow_banned,
             )
 
     async def register_device(
@@ -729,7 +744,7 @@ class RegistrationHandler(BaseHandler):
             # up when the access token is saved, but that's quite an
             # invasive change I'd rather do separately.
             user_tuple = await self.store.get_user_by_access_token(token)
-            token_id = user_tuple["token_id"]
+            token_id = user_tuple.token_id
 
             await self.pusher_pool.add_pusher(
                 user_id=user_id,

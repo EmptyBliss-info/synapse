@@ -12,13 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import collections
+import collections.abc
 import re
 from typing import Any, Mapping, Union
 
 from frozendict import frozendict
-
-from twisted.internet import defer
 
 from synapse.api.constants import EventTypes, RelationTypes
 from synapse.api.errors import Codes, SynapseError
@@ -49,6 +47,11 @@ def prune_event(event: EventBase) -> EventBase:
 
     pruned_event = make_event_from_dict(
         pruned_event_dict, event.room_version, event.internal_metadata.get_dict()
+    )
+
+    # copy the internal fields
+    pruned_event.internal_metadata.stream_ordering = (
+        event.internal_metadata.stream_ordering
     )
 
     # Mark the event as redacted
@@ -177,7 +180,7 @@ def only_fields(dictionary, fields):
     in 'fields'.
 
     If there are no event fields specified then all fields are included.
-    The entries may include '.' charaters to indicate sub-fields.
+    The entries may include '.' characters to indicate sub-fields.
     So ['content.body'] will include the 'body' field of the 'content' object.
     A literal '.' character in a field name may be escaped using a '\'.
 
@@ -324,7 +327,7 @@ def serialize_event(
     return d
 
 
-class EventClientSerializer(object):
+class EventClientSerializer:
     """Serializes events that are to be sent to clients.
 
     This is used for bundling extra information with any events to be sent to
@@ -337,8 +340,9 @@ class EventClientSerializer(object):
             hs.config.experimental_msc1849_support_enabled
         )
 
-    @defer.inlineCallbacks
-    def serialize_event(self, event, time_now, bundle_aggregations=True, **kwargs):
+    async def serialize_event(
+        self, event, time_now, bundle_aggregations=True, **kwargs
+    ):
         """Serializes a single event.
 
         Args:
@@ -348,7 +352,7 @@ class EventClientSerializer(object):
             **kwargs: Arguments to pass to `serialize_event`
 
         Returns:
-            Deferred[dict]: The serialized event
+            dict: The serialized event
         """
         # To handle the case of presence events and the like
         if not isinstance(event, EventBase):
@@ -363,8 +367,8 @@ class EventClientSerializer(object):
         if not event.internal_metadata.is_redacted() and (
             self.experimental_msc1849_support_enabled and bundle_aggregations
         ):
-            annotations = yield self.store.get_aggregation_groups_for_event(event_id)
-            references = yield self.store.get_relations_for_event(
+            annotations = await self.store.get_aggregation_groups_for_event(event_id)
+            references = await self.store.get_relations_for_event(
                 event_id, RelationTypes.REFERENCE, direction="f"
             )
 
@@ -378,7 +382,7 @@ class EventClientSerializer(object):
 
             edit = None
             if event.type == EventTypes.Message:
-                edit = yield self.store.get_applicable_edit(event_id)
+                edit = await self.store.get_applicable_edit(event_id)
 
             if edit:
                 # If there is an edit replace the content, preserving existing
@@ -424,7 +428,7 @@ def copy_power_levels_contents(
     Raises:
         TypeError if the input does not look like a valid power levels event content
     """
-    if not isinstance(old_power_levels, collections.Mapping):
+    if not isinstance(old_power_levels, collections.abc.Mapping):
         raise TypeError("Not a valid power-levels content: %r" % (old_power_levels,))
 
     power_levels = {}
@@ -434,7 +438,7 @@ def copy_power_levels_contents(
             power_levels[k] = v
             continue
 
-        if isinstance(v, collections.Mapping):
+        if isinstance(v, collections.abc.Mapping):
             power_levels[k] = h = {}
             for k1, v1 in v.items():
                 # we should only have one level of nesting

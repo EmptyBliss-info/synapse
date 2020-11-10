@@ -79,7 +79,7 @@ StreamUpdateResult = Tuple[List[Tuple[Token, StreamRow]], Token, bool]
 UpdateFunction = Callable[[str, Token, Token, int], Awaitable[StreamUpdateResult]]
 
 
-class Stream(object):
+class Stream:
     """Base class for the streams.
 
     Provides a `get_updates()` function that returns new updates since the last
@@ -240,12 +240,17 @@ class BackfillStream(Stream):
     ROW_TYPE = BackfillStreamRow
 
     def __init__(self, hs):
-        store = hs.get_datastore()
+        self.store = hs.get_datastore()
         super().__init__(
             hs.get_instance_name(),
-            current_token_without_instance(store.get_current_backfill_token),
-            store.get_all_new_backfill_event_rows,
+            self._current_token,
+            self.store.get_all_new_backfill_event_rows,
         )
+
+    def _current_token(self, instance_name: str) -> int:
+        # The backfill stream over replication operates on *positive* numbers,
+        # which means we need to negate it.
+        return -self.store._backfill_id_gen.get_current_token_for_writer(instance_name)
 
 
 class PresenceStream(Stream):
@@ -294,11 +299,12 @@ class TypingStream(Stream):
     def __init__(self, hs):
         typing_handler = hs.get_typing_handler()
 
-        if hs.config.worker_app is None:
-            # on the master, query the typing handler
+        writer_instance = hs.config.worker.writers.typing
+        if writer_instance == hs.get_instance_name():
+            # On the writer, query the typing handler
             update_function = typing_handler.get_all_typing_updates
         else:
-            # Query master process
+            # Query the typing writer process
             update_function = make_http_update_function(hs, self.NAME)
 
         super().__init__(
@@ -344,14 +350,14 @@ class PushRulesStream(Stream):
     def __init__(self, hs):
         self.store = hs.get_datastore()
 
-        super(PushRulesStream, self).__init__(
+        super().__init__(
             hs.get_instance_name(),
             self._current_token,
             self.store.get_all_push_rule_updates,
         )
 
     def _current_token(self, instance_name: str) -> int:
-        push_rules_token, _ = self.store.get_push_rules_stream_token()
+        push_rules_token = self.store.get_max_push_rules_stream_id()
         return push_rules_token
 
 
@@ -382,7 +388,7 @@ class CachesStream(Stream):
     the cache on the workers
     """
 
-    @attr.s
+    @attr.s(slots=True)
     class CachesStreamRow:
         """Stream to inform workers they should invalidate their cache.
 
@@ -404,7 +410,7 @@ class CachesStream(Stream):
         store = hs.get_datastore()
         super().__init__(
             hs.get_instance_name(),
-            store.get_cache_stream_token,
+            store.get_cache_stream_token_for_writer,
             store.get_all_updated_caches,
         )
 
@@ -440,7 +446,7 @@ class DeviceListsStream(Stream):
     told about a device update.
     """
 
-    @attr.s
+    @attr.s(slots=True)
     class DeviceListsStreamRow:
         entity = attr.ib(type=str)
 

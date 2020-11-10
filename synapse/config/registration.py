@@ -30,7 +30,7 @@ class AccountValidityConfig(Config):
     def __init__(self, config, synapse_config):
         if config is None:
             return
-        super(AccountValidityConfig, self).__init__()
+        super().__init__()
         self.enabled = config.get("enabled", False)
         self.renew_by_email_enabled = "renew_at" in config
 
@@ -143,7 +143,7 @@ class RegistrationConfig(Config):
             RoomCreationPreset.TRUSTED_PRIVATE_CHAT,
         }
 
-        # Pull the creater/inviter from the configuration, this gets used to
+        # Pull the creator/inviter from the configuration, this gets used to
         # send invites for invite-only rooms.
         mxid_localpart = config.get("auto_join_mxid_localpart")
         self.auto_join_user_id = None
@@ -186,6 +186,11 @@ class RegistrationConfig(Config):
         if session_lifetime is not None:
             session_lifetime = self.parse_duration(session_lifetime)
         self.session_lifetime = session_lifetime
+
+        # The success template used during fallback auth.
+        self.fallback_success_template = self.read_templates(
+            ["auth_success.html"], autoescape=True
+        )[0]
 
     def generate_config_section(self, generate_secrets=False, **kwargs):
         if generate_secrets:
@@ -332,24 +337,6 @@ class RegistrationConfig(Config):
         # This setting is ignored unless public_baseurl is also set.)
         #
         #default_identity_server: https://matrix.org
-
-        # The list of identity servers trusted to verify third party
-        # identifiers by this server.
-        #
-        # Also defines the ID server which will be called when an account is
-        # deactivated (one will be picked arbitrarily).
-        #
-        # Note: This option is deprecated. Since v0.99.4, Synapse has tracked which identity
-        # server a 3PID has been bound to. For 3PIDs bound before then, Synapse runs a
-        # background migration script, informing itself that the identity server all of its
-        # 3PIDs have been bound to is likely one of the below.
-        #
-        # As of Synapse v1.4.0, all other functionality of this option has been deprecated, and
-        # it is now solely used for the purposes of the background migration script, and can be
-        # removed once it has run.
-        #trusted_third_party_id_servers:
-        #  - matrix.org
-        #  - vector.im
 
         # Handle threepid (email/phone etc) registration and password resets through a set of
         # *trusted* identity servers. Note that this allows the configured identity server to

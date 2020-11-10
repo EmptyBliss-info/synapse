@@ -13,12 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import pymacaroons
 from netaddr import IPAddress
 
-from twisted.internet import defer
 from twisted.web.server import Request
 
 import synapse.types
@@ -34,8 +33,8 @@ from synapse.api.errors import (
 from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
 from synapse.events import EventBase
 from synapse.logging import opentracing as opentracing
+from synapse.storage.databases.main.registration import TokenLookupResult
 from synapse.types import StateMap, UserID
-from synapse.util.caches import register_cache
 from synapse.util.caches.lrucache import LruCache
 from synapse.util.metrics import Measure
 
@@ -59,7 +58,7 @@ class _InvalidMacaroonException(Exception):
     pass
 
 
-class Auth(object):
+class Auth:
     """
     FIXME: This class contains a mix of functions for authenticating users
     of our client-server API and authenticating events added to room graphs.
@@ -71,8 +70,9 @@ class Auth(object):
         self.store = hs.get_datastore()
         self.state = hs.get_state_handler()
 
-        self.token_cache = LruCache(10000)
-        register_cache("cache", "token_cache", self.token_cache)
+        self.token_cache = LruCache(
+            10000, "token_cache"
+        )  # type: LruCache[str, Tuple[str, bool]]
 
         self._auth_blocking = AuthBlocking(self.hs)
 
@@ -80,13 +80,14 @@ class Auth(object):
         self._track_appservice_user_ips = hs.config.track_appservice_user_ips
         self._macaroon_secret_key = hs.config.macaroon_secret_key
 
-    @defer.inlineCallbacks
-    def check_from_context(self, room_version: str, event, context, do_sig_check=True):
-        prev_state_ids = yield context.get_prev_state_ids()
-        auth_events_ids = yield self.compute_auth_events(
+    async def check_from_context(
+        self, room_version: str, event, context, do_sig_check=True
+    ):
+        prev_state_ids = await context.get_prev_state_ids()
+        auth_events_ids = self.compute_auth_events(
             event, prev_state_ids, for_verification=True
         )
-        auth_events = yield self.store.get_events(auth_events_ids)
+        auth_events = await self.store.get_events(auth_events_ids)
         auth_events = {(e.type, e.state_key): e for e in auth_events.values()}
 
         room_version_obj = KNOWN_ROOM_VERSIONS[room_version]
@@ -94,14 +95,13 @@ class Auth(object):
             room_version_obj, event, auth_events=auth_events, do_sig_check=do_sig_check
         )
 
-    @defer.inlineCallbacks
-    def check_user_in_room(
+    async def check_user_in_room(
         self,
         room_id: str,
         user_id: str,
         current_state: Optional[StateMap[EventBase]] = None,
         allow_departed_users: bool = False,
-    ):
+    ) -> EventBase:
         """Check if the user is in the room, or was at some point.
         Args:
             room_id: The room to check.
@@ -119,35 +119,35 @@ class Auth(object):
         Raises:
             AuthError if the user is/was not in the room.
         Returns:
-            Deferred[Optional[EventBase]]:
-                Membership event for the user if the user was in the
-                room. This will be the join event if they are currently joined to
-                the room. This will be the leave event if they have left the room.
+            Membership event for the user if the user was in the
+            room. This will be the join event if they are currently joined to
+            the room. This will be the leave event if they have left the room.
         """
         if current_state:
             member = current_state.get((EventTypes.Member, user_id), None)
         else:
-            member = yield self.state.get_current_state(
+            member = await self.state.get_current_state(
                 room_id=room_id, event_type=EventTypes.Member, state_key=user_id
             )
-        membership = member.membership if member else None
 
-        if membership == Membership.JOIN:
-            return member
+        if member:
+            membership = member.membership
 
-        # XXX this looks totally bogus. Why do we not allow users who have been banned,
-        # or those who were members previously and have been re-invited?
-        if allow_departed_users and membership == Membership.LEAVE:
-            forgot = yield self.store.did_forget(user_id, room_id)
-            if not forgot:
+            if membership == Membership.JOIN:
                 return member
+
+            # XXX this looks totally bogus. Why do we not allow users who have been banned,
+            # or those who were members previously and have been re-invited?
+            if allow_departed_users and membership == Membership.LEAVE:
+                forgot = await self.store.did_forget(user_id, room_id)
+                if not forgot:
+                    return member
 
         raise AuthError(403, "User %s not in room %s" % (user_id, room_id))
 
-    @defer.inlineCallbacks
-    def check_host_in_room(self, room_id, host):
+    async def check_host_in_room(self, room_id, host):
         with Measure(self.clock, "check_host_in_room"):
-            latest_event_ids = yield self.store.is_host_joined(room_id, host)
+            latest_event_ids = await self.store.is_host_joined(room_id, host)
             return latest_event_ids
 
     def can_federate(self, event, auth_events):
@@ -158,14 +158,13 @@ class Auth(object):
     def get_public_keys(self, invite_event):
         return event_auth.get_public_keys(invite_event)
 
-    @defer.inlineCallbacks
-    def get_user_by_req(
+    async def get_user_by_req(
         self,
         request: Request,
         allow_guest: bool = False,
         rights: str = "access",
         allow_expired: bool = False,
-    ):
+    ) -> synapse.types.Requester:
         """ Get a registered user's ID.
 
         Args:
@@ -178,7 +177,7 @@ class Auth(object):
                 /login will deliver access tokens regardless of expiration.
 
         Returns:
-            defer.Deferred: resolves to a `synapse.types.Requester` object
+            Resolves to the requester
         Raises:
             InvalidClientCredentialsError if no user by that token exists or the token
                 is invalid.
@@ -186,20 +185,14 @@ class Auth(object):
         """
         try:
             ip_addr = self.hs.get_ip_from_request(request)
-            user_agent = request.requestHeaders.getRawHeaders(
-                b"User-Agent", default=[b""]
-            )[0].decode("ascii", "surrogateescape")
+            user_agent = request.get_user_agent("")
 
             access_token = self.get_access_token_from_request(request)
 
-            user_id, app_service = yield self._get_appservice_user_id(request)
+            user_id, app_service = await self._get_appservice_user_id(request)
             if user_id:
-                request.authenticated_entity = user_id
-                opentracing.set_tag("authenticated_entity", user_id)
-                opentracing.set_tag("appservice_id", app_service.id)
-
                 if ip_addr and self._track_appservice_user_ips:
-                    yield self.store.insert_client_ip(
+                    await self.store.insert_client_ip(
                         user_id=user_id,
                         access_token=access_token,
                         ip=ip_addr,
@@ -207,34 +200,38 @@ class Auth(object):
                         device_id="dummy-device",  # stubbed
                     )
 
-                return synapse.types.create_requester(user_id, app_service=app_service)
+                requester = synapse.types.create_requester(
+                    user_id, app_service=app_service
+                )
 
-            user_info = yield self.get_user_by_access_token(
+                request.requester = user_id
+                opentracing.set_tag("authenticated_entity", user_id)
+                opentracing.set_tag("user_id", user_id)
+                opentracing.set_tag("appservice_id", app_service.id)
+
+                return requester
+
+            user_info = await self.get_user_by_access_token(
                 access_token, rights, allow_expired=allow_expired
             )
-            user = user_info["user"]
-            token_id = user_info["token_id"]
-            is_guest = user_info["is_guest"]
+            token_id = user_info.token_id
+            is_guest = user_info.is_guest
+            shadow_banned = user_info.shadow_banned
 
             # Deny the request if the user account has expired.
             if self._account_validity.enabled and not allow_expired:
-                user_id = user.to_string()
-                expiration_ts = yield self.store.get_expiration_ts_for_user(user_id)
-                if (
-                    expiration_ts is not None
-                    and self.clock.time_msec() >= expiration_ts
+                if await self.store.is_account_expired(
+                    user_info.user_id, self.clock.time_msec()
                 ):
                     raise AuthError(
                         403, "User account has expired", errcode=Codes.EXPIRED_ACCOUNT
                     )
 
-            # device_id may not be present if get_user_by_access_token has been
-            # stubbed out.
-            device_id = user_info.get("device_id")
+            device_id = user_info.device_id
 
-            if user and access_token and ip_addr:
-                yield self.store.insert_client_ip(
-                    user_id=user.to_string(),
+            if access_token and ip_addr:
+                await self.store.insert_client_ip(
+                    user_id=user_info.token_owner,
                     access_token=access_token,
                     ip=ip_addr,
                     user_agent=user_agent,
@@ -248,19 +245,27 @@ class Auth(object):
                     errcode=Codes.GUEST_ACCESS_FORBIDDEN,
                 )
 
-            request.authenticated_entity = user.to_string()
-            opentracing.set_tag("authenticated_entity", user.to_string())
+            requester = synapse.types.create_requester(
+                user_info.user_id,
+                token_id,
+                is_guest,
+                shadow_banned,
+                device_id,
+                app_service=app_service,
+                authenticated_entity=user_info.token_owner,
+            )
+
+            request.requester = requester
+            opentracing.set_tag("authenticated_entity", user_info.token_owner)
+            opentracing.set_tag("user_id", user_info.user_id)
             if device_id:
                 opentracing.set_tag("device_id", device_id)
 
-            return synapse.types.create_requester(
-                user, token_id, is_guest, device_id, app_service=app_service
-            )
+            return requester
         except KeyError:
             raise MissingClientTokenError()
 
-    @defer.inlineCallbacks
-    def _get_appservice_user_id(self, request):
+    async def _get_appservice_user_id(self, request):
         app_service = self.store.get_app_service_by_token(
             self.get_access_token_from_request(request)
         )
@@ -281,14 +286,13 @@ class Auth(object):
 
         if not app_service.is_interested_in_user(user_id):
             raise AuthError(403, "Application service cannot masquerade as this user.")
-        if not (yield self.store.get_user_by_id(user_id)):
+        if not (await self.store.get_user_by_id(user_id)):
             raise AuthError(403, "Application service has not registered this user")
         return user_id, app_service
 
-    @defer.inlineCallbacks
-    def get_user_by_access_token(
+    async def get_user_by_access_token(
         self, token: str, rights: str = "access", allow_expired: bool = False,
-    ):
+    ) -> TokenLookupResult:
         """ Validate access token and get user_id from it
 
         Args:
@@ -297,12 +301,7 @@ class Auth(object):
                 allow this
             allow_expired: If False, raises an InvalidClientTokenError
                 if the token is expired
-        Returns:
-            Deferred[dict]: dict that includes:
-               `user` (UserID)
-               `is_guest` (bool)
-               `token_id` (int|None): access token id. May be None if guest
-               `device_id` (str|None): device corresponding to access token
+
         Raises:
             InvalidClientTokenError if a user by that token exists, but the token is
                 expired
@@ -312,9 +311,9 @@ class Auth(object):
 
         if rights == "access":
             # first look in the database
-            r = yield self._look_up_user_by_access_token(token)
+            r = await self.store.get_user_by_access_token(token)
             if r:
-                valid_until_ms = r["valid_until_ms"]
+                valid_until_ms = r.valid_until_ms
                 if (
                     not allow_expired
                     and valid_until_ms is not None
@@ -331,7 +330,6 @@ class Auth(object):
         # otherwise it needs to be a valid macaroon
         try:
             user_id, guest = self._parse_and_validate_macaroon(token, rights)
-            user = UserID.from_string(user_id)
 
             if rights == "access":
                 if not guest:
@@ -350,28 +348,24 @@ class Auth(object):
                 # It would of course be much easier to store guest access
                 # tokens in the database as well, but that would break existing
                 # guest tokens.
-                stored_user = yield self.store.get_user_by_id(user_id)
+                stored_user = await self.store.get_user_by_id(user_id)
                 if not stored_user:
                     raise InvalidClientTokenError("Unknown user_id %s" % user_id)
                 if not stored_user["is_guest"]:
                     raise InvalidClientTokenError(
                         "Guest access token used for regular user"
                     )
-                ret = {
-                    "user": user,
-                    "is_guest": True,
-                    "token_id": None,
+
+                ret = TokenLookupResult(
+                    user_id=user_id,
+                    is_guest=True,
                     # all guests get the same device id
-                    "device_id": GUEST_DEVICE_ID,
-                }
+                    device_id=GUEST_DEVICE_ID,
+                )
             elif rights == "delete_pusher":
                 # We don't store these tokens in the database
-                ret = {
-                    "user": user,
-                    "is_guest": False,
-                    "token_id": None,
-                    "device_id": None,
-                }
+
+                ret = TokenLookupResult(user_id=user_id, is_guest=False)
             else:
                 raise RuntimeError("Unknown rights setting %s", rights)
             return ret
@@ -480,32 +474,16 @@ class Auth(object):
         now = self.hs.get_clock().time_msec()
         return now < expiry
 
-    @defer.inlineCallbacks
-    def _look_up_user_by_access_token(self, token):
-        ret = yield self.store.get_user_by_access_token(token)
-        if not ret:
-            return None
-
-        # we use ret.get() below because *lots* of unit tests stub out
-        # get_user_by_access_token in a way where it only returns a couple of
-        # the fields.
-        user_info = {
-            "user": UserID.from_string(ret.get("name")),
-            "token_id": ret.get("token_id", None),
-            "is_guest": False,
-            "device_id": ret.get("device_id"),
-            "valid_until_ms": ret.get("valid_until_ms"),
-        }
-        return user_info
-
     def get_appservice_by_req(self, request):
         token = self.get_access_token_from_request(request)
         service = self.store.get_app_service_by_token(token)
         if not service:
             logger.warning("Unrecognised appservice access token.")
             raise InvalidClientTokenError()
-        request.authenticated_entity = service.sender
-        return defer.succeed(service)
+        request.requester = synapse.types.create_requester(
+            service.sender, app_service=service
+        )
+        return service
 
     async def is_server_admin(self, user: UserID) -> bool:
         """ Check if the given user is a local server admin.
@@ -520,7 +498,7 @@ class Auth(object):
 
     def compute_auth_events(
         self, event, current_state_ids: StateMap[str], for_verification: bool = False,
-    ):
+    ) -> List[str]:
         """Given an event and current state return the list of event IDs used
         to auth an event.
 
@@ -528,11 +506,11 @@ class Auth(object):
         should be added to the event's `auth_events`.
 
         Returns:
-            defer.Deferred(list[str]): List of event IDs.
+            List of event IDs.
         """
 
         if event.type == EventTypes.Create:
-            return defer.succeed([])
+            return []
 
         # Currently we ignore the `for_verification` flag even though there are
         # some situations where we can drop particular auth events when adding
@@ -551,7 +529,7 @@ class Auth(object):
             if auth_ev_id:
                 auth_ids.append(auth_ev_id)
 
-        return defer.succeed(auth_ids)
+        return auth_ids
 
     async def check_can_change_room_list(self, room_id: str, user: UserID):
         """Determine whether the user is allowed to edit the room's entry in the
@@ -634,10 +612,9 @@ class Auth(object):
 
             return query_params[0].decode("ascii")
 
-    @defer.inlineCallbacks
-    def check_user_in_room_or_world_readable(
+    async def check_user_in_room_or_world_readable(
         self, room_id: str, user_id: str, allow_departed_users: bool = False
-    ):
+    ) -> Tuple[str, Optional[str]]:
         """Checks that the user is or was in the room or the room is world
         readable. If it isn't then an exception is raised.
 
@@ -648,10 +625,9 @@ class Auth(object):
                 members but have now departed
 
         Returns:
-            Deferred[tuple[str, str|None]]: Resolves to the current membership of
-                the user in the room and the membership event ID of the user. If
-                the user is not in the room and never has been, then
-                `(Membership.JOIN, None)` is returned.
+            Resolves to the current membership of the user in the room and the
+            membership event ID of the user. If the user is not in the room and
+            never has been, then `(Membership.JOIN, None)` is returned.
         """
 
         try:
@@ -660,12 +636,12 @@ class Auth(object):
             #  * The user is a non-guest user, and was ever in the room
             #  * The user is a guest user, and has joined the room
             # else it will throw.
-            member_event = yield self.check_user_in_room(
+            member_event = await self.check_user_in_room(
                 room_id, user_id, allow_departed_users=allow_departed_users
             )
             return member_event.membership, member_event.event_id
         except AuthError:
-            visibility = yield self.state.get_current_state(
+            visibility = await self.state.get_current_state(
                 room_id, EventTypes.RoomHistoryVisibility, ""
             )
             if (

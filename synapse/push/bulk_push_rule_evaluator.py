@@ -15,18 +15,19 @@
 # limitations under the License.
 
 import logging
-from collections import namedtuple
 
+import attr
 from prometheus_client import Counter
 
-from twisted.internet import defer
-
-from synapse.api.constants import EventTypes, Membership
+from synapse.api.constants import EventTypes, Membership, RelationTypes
 from synapse.event_auth import get_user_power_level
+from synapse.events import EventBase
+from synapse.events.snapshot import EventContext
 from synapse.state import POWER_KEY
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches import register_cache
-from synapse.util.caches.descriptors import cached
+from synapse.util.caches.descriptors import lru_cache
+from synapse.util.caches.lrucache import LruCache
 
 from .push_rule_evaluator import PushRuleEvaluatorForEvent
 
@@ -53,7 +54,49 @@ push_rules_delta_state_cache_metric = register_cache(
 )
 
 
-class BulkPushRuleEvaluator(object):
+STATE_EVENT_TYPES_TO_MARK_UNREAD = {
+    EventTypes.Topic,
+    EventTypes.Name,
+    EventTypes.RoomAvatar,
+    EventTypes.Tombstone,
+}
+
+
+def _should_count_as_unread(event: EventBase, context: EventContext) -> bool:
+    # Exclude rejected and soft-failed events.
+    if context.rejected or event.internal_metadata.is_soft_failed():
+        return False
+
+    # Exclude notices.
+    if (
+        not event.is_state()
+        and event.type == EventTypes.Message
+        and event.content.get("msgtype") == "m.notice"
+    ):
+        return False
+
+    # Exclude edits.
+    relates_to = event.content.get("m.relates_to", {})
+    if relates_to.get("rel_type") == RelationTypes.REPLACE:
+        return False
+
+    # Mark events that have a non-empty string body as unread.
+    body = event.content.get("body")
+    if isinstance(body, str) and body:
+        return True
+
+    # Mark some state events as unread.
+    if event.is_state() and event.type in STATE_EVENT_TYPES_TO_MARK_UNREAD:
+        return True
+
+    # Mark encrypted events as unread.
+    if not event.is_state() and event.type == EventTypes.Encrypted:
+        return True
+
+    return False
+
+
+class BulkPushRuleEvaluator:
     """Calculates the outcome of push rules for an event for all users in the
     room at once.
     """
@@ -70,8 +113,7 @@ class BulkPushRuleEvaluator(object):
             resizable=False,
         )
 
-    @defer.inlineCallbacks
-    def _get_rules_for_event(self, event, context):
+    async def _get_rules_for_event(self, event, context):
         """This gets the rules for all users in the room at the time of the event,
         as well as the push rules for the invitee if the event is an invite.
 
@@ -79,25 +121,25 @@ class BulkPushRuleEvaluator(object):
             dict of user_id -> push_rules
         """
         room_id = event.room_id
-        rules_for_room = yield self._get_rules_for_room(room_id)
+        rules_for_room = self._get_rules_for_room(room_id)
 
-        rules_by_user = yield rules_for_room.get_rules(event, context)
+        rules_by_user = await rules_for_room.get_rules(event, context)
 
         # if this event is an invite event, we may need to run rules for the user
         # who's been invited, otherwise they won't get told they've been invited
         if event.type == "m.room.member" and event.content["membership"] == "invite":
             invited = event.state_key
             if invited and self.hs.is_mine_id(invited):
-                has_pusher = yield self.store.user_has_pusher(invited)
+                has_pusher = await self.store.user_has_pusher(invited)
                 if has_pusher:
                     rules_by_user = dict(rules_by_user)
-                    rules_by_user[invited] = yield self.store.get_push_rules_for_user(
+                    rules_by_user[invited] = await self.store.get_push_rules_for_user(
                         invited
                     )
 
         return rules_by_user
 
-    @cached()
+    @lru_cache()
     def _get_rules_for_room(self, room_id):
         """Get the current RulesForRoom object for the given room id
 
@@ -114,20 +156,19 @@ class BulkPushRuleEvaluator(object):
             self.room_push_rule_cache_metrics,
         )
 
-    @defer.inlineCallbacks
-    def _get_power_levels_and_sender_level(self, event, context):
-        prev_state_ids = yield context.get_prev_state_ids()
+    async def _get_power_levels_and_sender_level(self, event, context):
+        prev_state_ids = await context.get_prev_state_ids()
         pl_event_id = prev_state_ids.get(POWER_KEY)
         if pl_event_id:
             # fastpath: if there's a power level event, that's all we need, and
             # not having a power level event is an extreme edge case
-            pl_event = yield self.store.get_event(pl_event_id)
+            pl_event = await self.store.get_event(pl_event_id)
             auth_events = {POWER_KEY: pl_event}
         else:
-            auth_events_ids = yield self.auth.compute_auth_events(
+            auth_events_ids = self.auth.compute_auth_events(
                 event, prev_state_ids, for_verification=False
             )
-            auth_events = yield self.store.get_events(auth_events_ids)
+            auth_events = await self.store.get_events(auth_events_ids)
             auth_events = {(e.type, e.state_key): e for e in auth_events.values()}
 
         sender_level = get_user_power_level(event.sender, auth_events)
@@ -136,23 +177,22 @@ class BulkPushRuleEvaluator(object):
 
         return pl_event.content if pl_event else {}, sender_level
 
-    @defer.inlineCallbacks
-    def action_for_event_by_user(self, event, context):
-        """Given an event and context, evaluate the push rules and insert the
-        results into the event_push_actions_staging table.
-
-        Returns:
-            Deferred
+    async def action_for_event_by_user(self, event, context) -> None:
+        """Given an event and context, evaluate the push rules, check if the message
+        should increment the unread count, and insert the results into the
+        event_push_actions_staging table.
         """
-        rules_by_user = yield self._get_rules_for_event(event, context)
+        count_as_unread = _should_count_as_unread(event, context)
+
+        rules_by_user = await self._get_rules_for_event(event, context)
         actions_by_user = {}
 
-        room_members = yield self.store.get_joined_users_from_context(event, context)
+        room_members = await self.store.get_joined_users_from_context(event, context)
 
         (
             power_levels,
             sender_power_level,
-        ) = yield self._get_power_levels_and_sender_level(event, context)
+        ) = await self._get_power_levels_and_sender_level(event, context)
 
         evaluator = PushRuleEvaluatorForEvent(
             event, len(room_members), sender_power_level, power_levels
@@ -165,7 +205,7 @@ class BulkPushRuleEvaluator(object):
                 continue
 
             if not event.is_state():
-                is_ignored = yield self.store.is_ignored_by(event.sender, uid)
+                is_ignored = await self.store.is_ignored_by(event.sender, uid)
                 if is_ignored:
                     continue
 
@@ -179,6 +219,13 @@ class BulkPushRuleEvaluator(object):
                 # that user, as they might not be already joined.
                 if event.type == EventTypes.Member and event.state_key == uid:
                     display_name = event.content.get("displayname", None)
+
+            if count_as_unread:
+                # Add an element for the current user if the event needs to be marked as
+                # unread, so that add_push_actions_to_staging iterates over it.
+                # If the event shouldn't be marked as unread but should notify the
+                # current user, it'll be added to the dict later.
+                actions_by_user[uid] = []
 
             for rule in rules:
                 if "enabled" in rule and not rule["enabled"]:
@@ -197,7 +244,9 @@ class BulkPushRuleEvaluator(object):
         # Mark in the DB staging area the push actions for users who should be
         # notified for this event. (This will then get handled when we persist
         # the event)
-        yield self.store.add_push_actions_to_staging(event.event_id, actions_by_user)
+        await self.store.add_push_actions_to_staging(
+            event.event_id, actions_by_user, count_as_unread,
+        )
 
 
 def _condition_checker(evaluator, conditions, uid, display_name, cache):
@@ -220,19 +269,21 @@ def _condition_checker(evaluator, conditions, uid, display_name, cache):
     return True
 
 
-class RulesForRoom(object):
+class RulesForRoom:
     """Caches push rules for users in a room.
 
     This efficiently handles users joining/leaving the room by not invalidating
     the entire cache for the room.
     """
 
-    def __init__(self, hs, room_id, rules_for_room_cache, room_push_rule_cache_metrics):
+    def __init__(
+        self, hs, room_id, rules_for_room_cache: LruCache, room_push_rule_cache_metrics
+    ):
         """
         Args:
             hs (HomeServer)
             room_id (str)
-            rules_for_room_cache(Cache): The cache object that caches these
+            rules_for_room_cache: The cache object that caches these
                 RoomsForUser objects.
             room_push_rule_cache_metrics (CacheMetric)
         """
@@ -274,8 +325,7 @@ class RulesForRoom(object):
         # to self around in the callback.
         self.invalidate_all_cb = _Invalidation(rules_for_room_cache, room_id)
 
-    @defer.inlineCallbacks
-    def get_rules(self, event, context):
+    async def get_rules(self, event, context):
         """Given an event context return the rules for all users who are
         currently in the room.
         """
@@ -286,7 +336,7 @@ class RulesForRoom(object):
             self.room_push_rule_cache_metrics.inc_hits()
             return self.rules_by_user
 
-        with (yield self.linearizer.queue(())):
+        with (await self.linearizer.queue(())):
             if state_group and self.state_group == state_group:
                 logger.debug("Using cached rules for %r", self.room_id)
                 self.room_push_rule_cache_metrics.inc_hits()
@@ -304,7 +354,7 @@ class RulesForRoom(object):
 
                 push_rules_delta_state_cache_metric.inc_hits()
             else:
-                current_state_ids = yield context.get_current_state_ids()
+                current_state_ids = await context.get_current_state_ids()
                 push_rules_delta_state_cache_metric.inc_misses()
 
             push_rules_state_size_counter.inc(len(current_state_ids))
@@ -343,15 +393,15 @@ class RulesForRoom(object):
                     continue
 
                 # If a user has left a room we remove their push rule. If they
-                # joined then we readd it later in _update_rules_with_member_event_ids
+                # joined then we re-add it later in _update_rules_with_member_event_ids
                 ret_rules_by_user.pop(user_id, None)
                 missing_member_event_ids[user_id] = event_id
 
             if missing_member_event_ids:
-                # If we have some memebr events we haven't seen, look them up
+                # If we have some member events we haven't seen, look them up
                 # and fetch push rules for them if appropriate.
                 logger.debug("Found new member events %r", missing_member_event_ids)
-                yield self._update_rules_with_member_event_ids(
+                await self._update_rules_with_member_event_ids(
                     ret_rules_by_user, missing_member_event_ids, state_group, event
                 )
             else:
@@ -369,8 +419,7 @@ class RulesForRoom(object):
             )
         return ret_rules_by_user
 
-    @defer.inlineCallbacks
-    def _update_rules_with_member_event_ids(
+    async def _update_rules_with_member_event_ids(
         self, ret_rules_by_user, member_event_ids, state_group, event
     ):
         """Update the partially filled rules_by_user dict by fetching rules for
@@ -379,14 +428,14 @@ class RulesForRoom(object):
         Args:
             ret_rules_by_user (dict): Partiallly filled dict of push rules. Gets
                 updated with any new rules.
-            member_event_ids (list): List of event ids for membership events that
-                have happened since the last time we filled rules_by_user
+            member_event_ids (dict): Dict of user id to event id for membership events
+                that have happened since the last time we filled rules_by_user
             state_group: The state group we are currently computing push rules
                 for. Used when updating the cache.
         """
         sequence = self.sequence
 
-        rows = yield self.store.get_membership_from_event_ids(member_event_ids.values())
+        rows = await self.store.get_membership_from_event_ids(member_event_ids.values())
 
         members = {row["event_id"]: (row["user_id"], row["membership"]) for row in rows}
 
@@ -400,36 +449,21 @@ class RulesForRoom(object):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Found members %r: %r", self.room_id, members.values())
 
-        interested_in_user_ids = {
+        user_ids = {
             user_id
             for user_id, membership in members.values()
             if membership == Membership.JOIN
         }
 
-        logger.debug("Joined: %r", interested_in_user_ids)
+        logger.debug("Joined: %r", user_ids)
 
-        if_users_with_pushers = yield self.store.get_if_users_have_pushers(
-            interested_in_user_ids, on_invalidate=self.invalidate_all_cb
-        )
+        # Previously we only considered users with pushers or read receipts in that
+        # room. We can't do this anymore because we use push actions to calculate unread
+        # counts, which don't rely on the user having pushers or sent a read receipt into
+        # the room. Therefore we just need to filter for local users here.
+        user_ids = list(filter(self.is_mine_id, user_ids))
 
-        user_ids = {
-            uid for uid, have_pusher in if_users_with_pushers.items() if have_pusher
-        }
-
-        logger.debug("With pushers: %r", user_ids)
-
-        users_with_receipts = yield self.store.get_users_with_read_receipts_in_room(
-            self.room_id, on_invalidate=self.invalidate_all_cb
-        )
-
-        logger.debug("With receipts: %r", users_with_receipts)
-
-        # any users with pushers must be ours: they have pushers
-        for uid in users_with_receipts:
-            if uid in interested_in_user_ids:
-                user_ids.add(uid)
-
-        rules_by_user = yield self.store.bulk_get_push_rules(
+        rules_by_user = await self.store.bulk_get_push_rules(
             user_ids, on_invalidate=self.invalidate_all_cb
         )
 
@@ -458,12 +492,20 @@ class RulesForRoom(object):
             self.state_group = state_group
 
 
-class _Invalidation(namedtuple("_Invalidation", ("cache", "room_id"))):
-    # We rely on _CacheContext implementing __eq__ and __hash__ sensibly,
-    # which namedtuple does for us (i.e. two _CacheContext are the same if
-    # their caches and keys match). This is important in particular to
-    # dedupe when we add callbacks to lru cache nodes, otherwise the number
-    # of callbacks would grow.
+@attr.attrs(slots=True, frozen=True)
+class _Invalidation:
+    # _Invalidation is passed as an `on_invalidate` callback to bulk_get_push_rules,
+    # which means that it it is stored on the bulk_get_push_rules cache entry. In order
+    # to ensure that we don't accumulate lots of redunant callbacks on the cache entry,
+    # we need to ensure that two _Invalidation objects are "equal" if they refer to the
+    # same `cache` and `room_id`.
+    #
+    # attrs provides suitable __hash__ and __eq__ methods, provided we remember to
+    # set `frozen=True`.
+
+    cache = attr.ib(type=LruCache)
+    room_id = attr.ib(type=str)
+
     def __call__(self):
         rules = self.cache.get(self.room_id, None, update_metrics=False)
         if rules:

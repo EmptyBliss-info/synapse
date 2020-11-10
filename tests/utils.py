@@ -21,6 +21,7 @@ import time
 import uuid
 import warnings
 from inspect import getcallargs
+from typing import Type
 from urllib import parse as urlparse
 
 from mock import Mock, patch
@@ -38,6 +39,7 @@ from synapse.http.server import HttpServer
 from synapse.logging.context import current_context, set_current_context
 from synapse.server import HomeServer
 from synapse.storage import DataStore
+from synapse.storage.database import LoggingDatabaseConnection
 from synapse.storage.engines import PostgresEngine, create_engine
 from synapse.storage.prepare_database import prepare_database
 from synapse.util.ratelimitutils import FederationRateLimiter
@@ -88,6 +90,7 @@ def setupdb():
             host=POSTGRES_HOST,
             password=POSTGRES_PASSWORD,
         )
+        db_conn = LoggingDatabaseConnection(db_conn, db_engine, "tests")
         prepare_database(db_conn, db_engine, None)
         db_conn.close()
 
@@ -154,6 +157,10 @@ def default_config(name, parse=False):
             "account": {"per_second": 10000, "burst_count": 10000},
             "failed_attempts": {"per_second": 10000, "burst_count": 10000},
         },
+        "rc_joins": {
+            "local": {"per_second": 10000, "burst_count": 10000},
+            "remote": {"per_second": 10000, "burst_count": 10000},
+        },
         "saml2_enabled": False,
         "public_baseurl": None,
         "default_identity_server": None,
@@ -186,11 +193,10 @@ class TestHomeServer(HomeServer):
 def setup_test_homeserver(
     cleanup_func,
     name="test",
-    datastore=None,
     config=None,
     reactor=None,
-    homeserverToUse=TestHomeServer,
-    **kargs
+    homeserver_to_use: Type[HomeServer] = TestHomeServer,
+    **kwargs
 ):
     """
     Setup a homeserver suitable for running tests against.  Keyword arguments
@@ -213,8 +219,8 @@ def setup_test_homeserver(
 
     config.ldap_enabled = False
 
-    if "clock" not in kargs:
-        kargs["clock"] = MockClock()
+    if "clock" not in kwargs:
+        kwargs["clock"] = MockClock()
 
     if USE_POSTGRES_FOR_TESTS:
         test_db = "synapse_test_%s" % uuid.uuid4().hex
@@ -243,7 +249,7 @@ def setup_test_homeserver(
 
     # Create the database before we actually try and connect to it, based off
     # the template database we generate in setupdb()
-    if datastore is None and isinstance(db_engine, PostgresEngine):
+    if isinstance(db_engine, PostgresEngine):
         db_conn = db_engine.module.connect(
             database=POSTGRES_BASE_DB,
             user=POSTGRES_USER,
@@ -259,79 +265,68 @@ def setup_test_homeserver(
         cur.close()
         db_conn.close()
 
-    if datastore is None:
-        hs = homeserverToUse(
-            name,
-            config=config,
-            version_string="Synapse/tests",
-            tls_server_context_factory=Mock(),
-            tls_client_options_factory=Mock(),
-            reactor=reactor,
-            **kargs
-        )
+    hs = homeserver_to_use(
+        name, config=config, version_string="Synapse/tests", reactor=reactor,
+    )
 
-        hs.setup()
-        if homeserverToUse.__name__ == "TestHomeServer":
-            hs.setup_master()
+    # Install @cache_in_self attributes
+    for key, val in kwargs.items():
+        setattr(hs, key, val)
 
-        if isinstance(db_engine, PostgresEngine):
-            database = hs.get_datastores().databases[0]
+    # Mock TLS
+    hs.tls_server_context_factory = Mock()
+    hs.tls_client_options_factory = Mock()
 
-            # We need to do cleanup on PostgreSQL
-            def cleanup():
-                import psycopg2
+    hs.setup()
+    if homeserver_to_use == TestHomeServer:
+        hs.setup_background_tasks()
 
-                # Close all the db pools
-                database._db_pool.close()
+    if isinstance(db_engine, PostgresEngine):
+        database = hs.get_datastores().databases[0]
 
-                dropped = False
+        # We need to do cleanup on PostgreSQL
+        def cleanup():
+            import psycopg2
 
-                # Drop the test database
-                db_conn = db_engine.module.connect(
-                    database=POSTGRES_BASE_DB,
-                    user=POSTGRES_USER,
-                    host=POSTGRES_HOST,
-                    password=POSTGRES_PASSWORD,
-                )
-                db_conn.autocommit = True
-                cur = db_conn.cursor()
+            # Close all the db pools
+            database._db_pool.close()
 
-                # Try a few times to drop the DB. Some things may hold on to the
-                # database for a few more seconds due to flakiness, preventing
-                # us from dropping it when the test is over. If we can't drop
-                # it, warn and move on.
-                for x in range(5):
-                    try:
-                        cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
-                        db_conn.commit()
-                        dropped = True
-                    except psycopg2.OperationalError as e:
-                        warnings.warn(
-                            "Couldn't drop old db: " + str(e), category=UserWarning
-                        )
-                        time.sleep(0.5)
+            dropped = False
 
-                cur.close()
-                db_conn.close()
+            # Drop the test database
+            db_conn = db_engine.module.connect(
+                database=POSTGRES_BASE_DB,
+                user=POSTGRES_USER,
+                host=POSTGRES_HOST,
+                password=POSTGRES_PASSWORD,
+            )
+            db_conn.autocommit = True
+            cur = db_conn.cursor()
 
-                if not dropped:
-                    warnings.warn("Failed to drop old DB.", category=UserWarning)
+            # Try a few times to drop the DB. Some things may hold on to the
+            # database for a few more seconds due to flakiness, preventing
+            # us from dropping it when the test is over. If we can't drop
+            # it, warn and move on.
+            for x in range(5):
+                try:
+                    cur.execute("DROP DATABASE IF EXISTS %s;" % (test_db,))
+                    db_conn.commit()
+                    dropped = True
+                except psycopg2.OperationalError as e:
+                    warnings.warn(
+                        "Couldn't drop old db: " + str(e), category=UserWarning
+                    )
+                    time.sleep(0.5)
 
-            if not LEAVE_DB:
-                # Register the cleanup hook
-                cleanup_func(cleanup)
+            cur.close()
+            db_conn.close()
 
-    else:
-        hs = homeserverToUse(
-            name,
-            datastore=datastore,
-            config=config,
-            version_string="Synapse/tests",
-            tls_server_context_factory=Mock(),
-            tls_client_options_factory=Mock(),
-            reactor=reactor,
-            **kargs
-        )
+            if not dropped:
+                warnings.warn("Failed to drop old DB.", category=UserWarning)
+
+        if not LEAVE_DB:
+            # Register the cleanup hook
+            cleanup_func(cleanup)
 
     # bcrypt is far too slow to be doing in unit tests
     # Need to let the HS build an auth handler and then mess with it
@@ -347,7 +342,7 @@ def setup_test_homeserver(
 
     hs.get_auth_handler().validate_hash = validate_hash
 
-    fed = kargs.get("resource_for_federation", None)
+    fed = kwargs.get("resource_for_federation", None)
     if fed:
         register_federation_servlets(hs, fed)
 
@@ -468,7 +463,7 @@ class MockHttpResource(HttpServer):
             self.callbacks.append((method, path_pattern, callback))
 
 
-class MockKey(object):
+class MockKey:
     alg = "mock_alg"
     version = "mock_version"
     signature = b"\x9a\x87$"
@@ -487,7 +482,7 @@ class MockKey(object):
         return b"<fake_encoded_key>"
 
 
-class MockClock(object):
+class MockClock:
     now = 1000
 
     def __init__(self):
@@ -564,7 +559,7 @@ def _format_call(args, kwargs):
     )
 
 
-class DeferredMockCallable(object):
+class DeferredMockCallable:
     """A callable instance that stores a set of pending call expectations and
     return values for them. It allows a unit test to assert that the given set
     of function calls are eventually made, by awaiting on them to be called.
@@ -638,14 +633,8 @@ class DeferredMockCallable(object):
             )
 
 
-@defer.inlineCallbacks
-def create_room(hs, room_id, creator_id):
+async def create_room(hs, room_id: str, creator_id: str):
     """Creates and persist a creation event for the given room
-
-    Args:
-        hs
-        room_id (str)
-        creator_id (str)
     """
 
     persistence_store = hs.get_storage().persistence
@@ -653,7 +642,7 @@ def create_room(hs, room_id, creator_id):
     event_builder_factory = hs.get_event_builder_factory()
     event_creation_handler = hs.get_event_creation_handler()
 
-    yield store.store_room(
+    await store.store_room(
         room_id=room_id,
         room_creator_user_id=creator_id,
         is_public=False,
@@ -671,6 +660,6 @@ def create_room(hs, room_id, creator_id):
         },
     )
 
-    event, context = yield event_creation_handler.create_new_client_event(builder)
+    event, context = await event_creation_handler.create_new_client_event(builder)
 
-    yield persistence_store.persist_event(event, context)
+    await persistence_store.persist_event(event, context)

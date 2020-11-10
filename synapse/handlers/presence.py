@@ -30,17 +30,17 @@ from typing import Dict, Iterable, List, Set, Tuple
 from prometheus_client import Counter
 from typing_extensions import ContextManager
 
-from twisted.internet import defer
-
 import synapse.metrics
 from synapse.api.constants import EventTypes, Membership, PresenceState
 from synapse.api.errors import SynapseError
+from synapse.api.presence import UserPresenceState
 from synapse.logging.context import run_in_background
 from synapse.logging.utils import log_function
 from synapse.metrics import LaterGauge
 from synapse.metrics.background_process_metrics import run_as_background_process
-from synapse.storage.presence import UserPresenceState
-from synapse.types import JsonDict, UserID, get_domain_from_id
+from synapse.state import StateHandler
+from synapse.storage.databases.main import DataStore
+from synapse.types import Collection, JsonDict, UserID, get_domain_from_id
 from synapse.util.async_helpers import Linearizer
 from synapse.util.caches.descriptors import cached
 from synapse.util.metrics import Measure
@@ -48,7 +48,7 @@ from synapse.util.wheel_timer import WheelTimer
 
 MYPY = False
 if MYPY:
-    import synapse.server
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,7 @@ assert LAST_ACTIVE_GRANULARITY < IDLE_TIMER
 class BasePresenceHandler(abc.ABC):
     """Parts of the PresenceHandler that are shared between workers and master"""
 
-    def __init__(self, hs: "synapse.server.HomeServer"):
+    def __init__(self, hs: "HomeServer"):
         self.clock = hs.get_clock()
         self.store = hs.get_datastore()
 
@@ -199,7 +199,7 @@ class BasePresenceHandler(abc.ABC):
 
 
 class PresenceHandler(BasePresenceHandler):
-    def __init__(self, hs: "synapse.server.HomeServer"):
+    def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
         self.hs = hs
         self.is_mine_id = hs.is_mine_id
@@ -319,7 +319,7 @@ class PresenceHandler(BasePresenceHandler):
         is some spurious presence changes that will self-correct.
         """
         # If the DB pool has already terminated, don't try updating
-        if not self.store.db.is_running():
+        if not self.store.db_pool.is_running():
             return
 
         logger.info(
@@ -802,7 +802,7 @@ class PresenceHandler(BasePresenceHandler):
             between the requested tokens due to the limit.
 
             The token returned can be used in a subsequent call to this
-            function to get further updatees.
+            function to get further updates.
 
             The updates are a list of 2-tuples of stream ID and the row data
         """
@@ -895,16 +895,9 @@ class PresenceHandler(BasePresenceHandler):
 
             await self._on_user_joined_room(room_id, state_key)
 
-    async def _on_user_joined_room(self, room_id, user_id):
+    async def _on_user_joined_room(self, room_id: str, user_id: str) -> None:
         """Called when we detect a user joining the room via the current state
         delta stream.
-
-        Args:
-            room_id (str)
-            user_id (str)
-
-        Returns:
-            Deferred
         """
 
         if self.is_mine_id(user_id):
@@ -935,8 +928,8 @@ class PresenceHandler(BasePresenceHandler):
             # TODO: Check that this is actually a new server joining the
             # room.
 
-            user_ids = await self.state.get_current_users_in_room(room_id)
-            user_ids = list(filter(self.is_mine_id, user_ids))
+            users = await self.state.get_current_users_in_room(room_id)
+            user_ids = list(filter(self.is_mine_id, users))
 
             states_d = await self.current_state_for_users(user_ids)
 
@@ -984,7 +977,7 @@ def should_notify(old_state, new_state):
             new_state.last_active_ts - old_state.last_active_ts
             > LAST_ACTIVE_GRANULARITY
         ):
-            # Only notify about last active bumps if we're not currently acive
+            # Only notify about last active bumps if we're not currently active
             if not new_state.currently_active:
                 notify_reason_counter.labels("last_active_change_online").inc()
                 return True
@@ -1017,8 +1010,8 @@ def format_user_presence_state(state, now, include_user_id=True):
     return content
 
 
-class PresenceEventSource(object):
-    def __init__(self, hs):
+class PresenceEventSource:
+    def __init__(self, hs: "HomeServer"):
         # We can't call get_presence_handler here because there's a cycle:
         #
         #   Presence -> Notifier -> PresenceEventSource -> Presence
@@ -1078,12 +1071,14 @@ class PresenceEventSource(object):
 
             users_interested_in = await self._get_interested_in(user, explicit_room_id)
 
-            user_ids_changed = set()
+            user_ids_changed = set()  # type: Collection[str]
             changed = None
             if from_key:
                 changed = stream_change_cache.get_all_entities_changed(from_key)
 
             if changed is not None and len(changed) < 500:
+                assert isinstance(user_ids_changed, set)
+
                 # For small deltas, its quicker to get all changes and then
                 # work out if we share a room or they're in our presence list
                 get_updates_counter.labels("stream").inc()
@@ -1114,9 +1109,6 @@ class PresenceEventSource(object):
 
     def get_current_key(self):
         return self.store.get_current_presence_token()
-
-    async def get_pagination_rows(self, user, pagination_config, key):
-        return await self.get_new_events(user, from_key=None, include_offline=False)
 
     @cached(num_args=2, cache_context=True)
     async def _get_interested_in(self, user, explicit_room_id, cache_context):
@@ -1296,22 +1288,24 @@ def handle_update(prev_state, new_state, is_mine, wheel_timer, now):
     return new_state, persist_and_notify, federation_ping
 
 
-@defer.inlineCallbacks
-def get_interested_parties(store, states):
+async def get_interested_parties(
+    store: DataStore, states: List[UserPresenceState]
+) -> Tuple[Dict[str, List[UserPresenceState]], Dict[str, List[UserPresenceState]]]:
     """Given a list of states return which entities (rooms, users)
     are interested in the given states.
 
     Args:
-        states (list(UserPresenceState))
+        store
+        states
 
     Returns:
-        2-tuple: `(room_ids_to_states, users_to_states)`,
+        A 2-tuple of `(room_ids_to_states, users_to_states)`,
         with each item being a dict of `entity_name` -> `[UserPresenceState]`
     """
     room_ids_to_states = {}  # type: Dict[str, List[UserPresenceState]]
     users_to_states = {}  # type: Dict[str, List[UserPresenceState]]
     for state in states:
-        room_ids = yield store.get_rooms_for_user(state.user_id)
+        room_ids = await store.get_rooms_for_user(state.user_id)
         for room_id in room_ids:
             room_ids_to_states.setdefault(room_id, []).append(state)
 
@@ -1321,31 +1315,33 @@ def get_interested_parties(store, states):
     return room_ids_to_states, users_to_states
 
 
-@defer.inlineCallbacks
-def get_interested_remotes(store, states, state_handler):
+async def get_interested_remotes(
+    store: DataStore, states: List[UserPresenceState], state_handler: StateHandler
+) -> List[Tuple[Collection[str], List[UserPresenceState]]]:
     """Given a list of presence states figure out which remote servers
     should be sent which.
 
     All the presence states should be for local users only.
 
     Args:
-        store (DataStore)
-        states (list(UserPresenceState))
+        store
+        states
+        state_handler
 
     Returns:
-        Deferred list of ([destinations], [UserPresenceState]), where for
-        each row the list of UserPresenceState should be sent to each
+        A list of 2-tuples of destinations and states, where for
+        each tuple the list of UserPresenceState should be sent to each
         destination
     """
-    hosts_and_states = []
+    hosts_and_states = []  # type: List[Tuple[Collection[str], List[UserPresenceState]]]
 
     # First we look up the rooms each user is in (as well as any explicit
     # subscriptions), then for each distinct room we look up the remote
     # hosts in those rooms.
-    room_ids_to_states, users_to_states = yield get_interested_parties(store, states)
+    room_ids_to_states, users_to_states = await get_interested_parties(store, states)
 
     for room_id, states in room_ids_to_states.items():
-        hosts = yield state_handler.get_current_hosts_in_room(room_id)
+        hosts = await state_handler.get_current_hosts_in_room(room_id)
         hosts_and_states.append((hosts, states))
 
     for user_id, states in users_to_states.items():

@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class StateDeltasHandler(object):
+class StateDeltasHandler:
     def __init__(self, hs):
         self.store = hs.get_datastore()
 
@@ -32,7 +32,7 @@ class StateDeltasHandler(object):
         Returns:
             None if the field in the events either both match `public_value`
             or if neither do, i.e. there has been no change.
-            True if it didnt match `public_value` but now does
+            True if it didn't match `public_value` but now does
             False if it did match `public_value` but now doesn't
         """
         prev_event = None

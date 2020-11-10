@@ -27,7 +27,7 @@
     different thread to Synapse. This can make it more resilient to
     heavy load meaning metrics cannot be retrieved, and can be exposed
     to just internal networks easier. The served metrics are available
-    over HTTP only, and will be available at `/`.
+    over HTTP only, and will be available at `/_synapse/metrics`.
 
     Add a new listener to homeserver.yaml:
 
@@ -59,6 +59,8 @@
     `static_configs` in the above with `target_groups`.
 
 1.  Restart Prometheus.
+
+1.  Consider using the [grafana dashboard](https://github.com/matrix-org/synapse/tree/master/contrib/grafana/) and required [recording rules](https://github.com/matrix-org/synapse/tree/master/contrib/prometheus/) 
 
 ## Monitoring workers
 

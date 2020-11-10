@@ -18,7 +18,9 @@ from mock import Mock
 from twisted.internet import defer
 
 from synapse.handlers.appservice import ApplicationServicesHandler
+from synapse.types import RoomStreamToken
 
+from tests.test_utils import make_awaitable
 from tests.utils import MockClock
 
 from .. import unittest
@@ -40,7 +42,6 @@ class AppServiceHandlerTestCase(unittest.TestCase):
         hs.get_clock.return_value = MockClock()
         self.handler = ApplicationServicesHandler(hs)
 
-    @defer.inlineCallbacks
     def test_notify_interested_services(self):
         interested_service = self._mkservice(is_interested=True)
         services = [
@@ -60,12 +61,12 @@ class AppServiceHandlerTestCase(unittest.TestCase):
             defer.succeed((0, [event])),
             defer.succeed((0, [])),
         ]
-        yield defer.ensureDeferred(self.handler.notify_interested_services(0))
+        self.handler.notify_interested_services(RoomStreamToken(None, 0))
+
         self.mock_scheduler.submit_event_for_as.assert_called_once_with(
             interested_service, event
         )
 
-    @defer.inlineCallbacks
     def test_query_user_exists_unknown_user(self):
         user_id = "@someone:anywhere"
         services = [self._mkservice(is_interested=True)]
@@ -79,10 +80,11 @@ class AppServiceHandlerTestCase(unittest.TestCase):
             defer.succeed((0, [event])),
             defer.succeed((0, [])),
         ]
-        yield defer.ensureDeferred(self.handler.notify_interested_services(0))
+
+        self.handler.notify_interested_services(RoomStreamToken(None, 0))
+
         self.mock_as_api.query_user.assert_called_once_with(services[0], user_id)
 
-    @defer.inlineCallbacks
     def test_query_user_exists_known_user(self):
         user_id = "@someone:anywhere"
         services = [self._mkservice(is_interested=True)]
@@ -96,7 +98,9 @@ class AppServiceHandlerTestCase(unittest.TestCase):
             defer.succeed((0, [event])),
             defer.succeed((0, [])),
         ]
-        yield defer.ensureDeferred(self.handler.notify_interested_services(0))
+
+        self.handler.notify_interested_services(RoomStreamToken(None, 0))
+
         self.assertFalse(
             self.mock_as_api.query_user.called,
             "query_user called when it shouldn't have been.",
@@ -117,9 +121,9 @@ class AppServiceHandlerTestCase(unittest.TestCase):
             self._mkservice_alias(is_interested_in_alias=False),
         ]
 
-        self.mock_as_api.query_alias.return_value = defer.succeed(True)
+        self.mock_as_api.query_alias.return_value = make_awaitable(True)
         self.mock_store.get_app_services.return_value = services
-        self.mock_store.get_association_from_room_alias.return_value = defer.succeed(
+        self.mock_store.get_association_from_room_alias.return_value = make_awaitable(
             Mock(room_id=room_id, servers=servers)
         )
 
@@ -135,7 +139,7 @@ class AppServiceHandlerTestCase(unittest.TestCase):
 
     def _mkservice(self, is_interested):
         service = Mock()
-        service.is_interested.return_value = defer.succeed(is_interested)
+        service.is_interested.return_value = make_awaitable(is_interested)
         service.token = "mock_service_token"
         service.url = "mock_service_url"
         return service

@@ -14,20 +14,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import gc
 import hashlib
 import hmac
 import inspect
 import logging
 import time
-from typing import Optional, Tuple, Type, TypeVar, Union
+from typing import Optional, Tuple, Type, TypeVar, Union, overload
 
-from mock import Mock
+from mock import Mock, patch
 
 from canonicaljson import json
 
 from twisted.internet.defer import Deferred, ensureDeferred, succeed
+from twisted.python.failure import Failure
 from twisted.python.threadpool import ThreadPool
 from twisted.trial import unittest
 
@@ -44,7 +44,7 @@ from synapse.logging.context import (
     set_current_context,
 )
 from synapse.server import HomeServer
-from synapse.types import Requester, UserID, create_requester
+from synapse.types import UserID, create_requester
 from synapse.util.ratelimitutils import FederationRateLimiter
 
 from tests.server import (
@@ -54,7 +54,7 @@ from tests.server import (
     render,
     setup_test_homeserver,
 )
-from tests.test_utils import event_injection
+from tests.test_utils import event_injection, setup_awaitable_errors
 from tests.test_utils.logging_setup import setup_logging
 from tests.utils import default_config, setupdb
 
@@ -92,7 +92,7 @@ class TestCase(unittest.TestCase):
     root logger's logging level while that test (case|method) runs."""
 
     def __init__(self, methodName, *args, **kwargs):
-        super(TestCase, self).__init__(methodName, *args, **kwargs)
+        super().__init__(methodName, *args, **kwargs)
 
         method = getattr(self, methodName)
 
@@ -118,6 +118,10 @@ class TestCase(unittest.TestCase):
                     return ret
 
                 logging.getLogger().setLevel(level)
+
+            # Trial messes with the warnings configuration, thus this has to be
+            # done in the context of an individual TestCase.
+            self.addCleanup(setup_awaitable_errors())
 
             return orig()
 
@@ -167,6 +171,19 @@ def INFO(target):
     Can apply to either a TestCase or an individual test method."""
     target.loglevel = logging.INFO
     return target
+
+
+def logcontext_clean(target):
+    """A decorator which marks the TestCase or method as 'logcontext_clean'
+
+    ... ie, any logcontext errors should cause a test failure
+    """
+
+    def logcontext_error(msg):
+        raise AssertionError("logcontext error: %s" % (msg))
+
+    patcher = patch("synapse.logging.context.logcontext_error", new=logcontext_error)
+    return patcher(target)
 
 
 class HomeserverTestCase(TestCase):
@@ -228,7 +245,7 @@ class HomeserverTestCase(TestCase):
         # create a site to wrap the resource.
         self.site = SynapseSite(
             logger_name="synapse.access.http.fake",
-            site_tag="test",
+            site_tag=self.hs.config.server.server_name,
             config=self.hs.config.server.listeners[0],
             resource=self.resource,
             server_version_string="1",
@@ -241,20 +258,27 @@ class HomeserverTestCase(TestCase):
         if hasattr(self, "user_id"):
             if self.hijack_auth:
 
-                def get_user_by_access_token(token=None, allow_guest=False):
-                    return succeed(
-                        {
-                            "user": UserID.from_string(self.helper.auth_user_id),
-                            "token_id": 1,
-                            "is_guest": False,
-                        }
+                # We need a valid token ID to satisfy foreign key constraints.
+                token_id = self.get_success(
+                    self.hs.get_datastore().add_access_token_to_user(
+                        self.helper.auth_user_id, "some_fake_token", None, None,
                     )
+                )
 
-                def get_user_by_req(request, allow_guest=False, rights="access"):
-                    return succeed(
-                        create_requester(
-                            UserID.from_string(self.helper.auth_user_id), 1, False, None
-                        )
+                async def get_user_by_access_token(token=None, allow_guest=False):
+                    return {
+                        "user": UserID.from_string(self.helper.auth_user_id),
+                        "token_id": token_id,
+                        "is_guest": False,
+                    }
+
+                async def get_user_by_req(request, allow_guest=False, rights="access"):
+                    return create_requester(
+                        UserID.from_string(self.helper.auth_user_id),
+                        token_id,
+                        False,
+                        False,
+                        None,
                     )
 
                 self.hs.get_auth().get_user_by_req = get_user_by_req
@@ -344,6 +368,23 @@ class HomeserverTestCase(TestCase):
         Function to optionally be overridden in subclasses.
         """
 
+    # Annoyingly mypy doesn't seem to pick up the fact that T is SynapseRequest
+    # when the `request` arg isn't given, so we define an explicit override to
+    # cover that case.
+    @overload
+    def make_request(
+        self,
+        method: Union[bytes, str],
+        path: Union[bytes, str],
+        content: Union[bytes, dict] = b"",
+        access_token: Optional[str] = None,
+        shorthand: bool = True,
+        federation_auth_origin: str = None,
+        content_is_form: bool = False,
+    ) -> Tuple[SynapseRequest, FakeChannel]:
+        ...
+
+    @overload
     def make_request(
         self,
         method: Union[bytes, str],
@@ -353,6 +394,20 @@ class HomeserverTestCase(TestCase):
         request: Type[T] = SynapseRequest,
         shorthand: bool = True,
         federation_auth_origin: str = None,
+        content_is_form: bool = False,
+    ) -> Tuple[T, FakeChannel]:
+        ...
+
+    def make_request(
+        self,
+        method: Union[bytes, str],
+        path: Union[bytes, str],
+        content: Union[bytes, dict] = b"",
+        access_token: Optional[str] = None,
+        request: Type[T] = SynapseRequest,
+        shorthand: bool = True,
+        federation_auth_origin: str = None,
+        content_is_form: bool = False,
     ) -> Tuple[T, FakeChannel]:
         """
         Create a SynapseRequest at the path using the method and containing the
@@ -368,6 +423,8 @@ class HomeserverTestCase(TestCase):
             with the usual REST API path, if it doesn't contain it.
             federation_auth_origin (bytes|None): if set to not-None, we will add a fake
                 Authorization header pretenting to be the given server name.
+            content_is_form: Whether the content is URL encoded form data. Adds the
+                'Content-Type': 'application/x-www-form-urlencoded' header.
 
         Returns:
             Tuple[synapse.http.site.SynapseRequest, channel]
@@ -384,6 +441,7 @@ class HomeserverTestCase(TestCase):
             request,
             shorthand,
             federation_auth_origin,
+            content_is_form,
         )
 
     def render(self, request):
@@ -422,8 +480,8 @@ class HomeserverTestCase(TestCase):
 
         async def run_bg_updates():
             with LoggingContext("run_bg_updates", request="run_bg_updates-1"):
-                while not await stor.db.updates.has_completed_background_updates():
-                    await stor.db.updates.do_next_background_update(1)
+                while not await stor.db_pool.updates.has_completed_background_updates():
+                    await stor.db_pool.updates.do_next_background_update(1)
 
         hs = setup_test_homeserver(self.addCleanup, *args, **kwargs)
         stor = hs.get_datastore()
@@ -459,18 +517,53 @@ class HomeserverTestCase(TestCase):
         self.pump()
         return self.failureResultOf(d, exc)
 
-    def register_user(self, username, password, admin=False):
+    def get_success_or_raise(self, d, by=0.0):
+        """Drive deferred to completion and return result or raise exception
+        on failure.
+        """
+
+        if inspect.isawaitable(d):
+            deferred = ensureDeferred(d)
+        if not isinstance(deferred, Deferred):
+            return d
+
+        results = []  # type: list
+        deferred.addBoth(results.append)
+
+        self.pump(by=by)
+
+        if not results:
+            self.fail(
+                "Success result expected on {!r}, found no result instead".format(
+                    deferred
+                )
+            )
+
+        result = results[0]
+
+        if isinstance(result, Failure):
+            result.raiseException()
+
+        return result
+
+    def register_user(
+        self,
+        username: str,
+        password: str,
+        admin: Optional[bool] = False,
+        displayname: Optional[str] = None,
+    ) -> str:
         """
         Register a user. Requires the Admin API be registered.
 
         Args:
-            username (bytes/unicode): The user part of the new user.
-            password (bytes/unicode): The password of the new user.
-            admin (bool): Whether the user should be created as an admin
-            or not.
+            username: The user part of the new user.
+            password: The password of the new user.
+            admin: Whether the user should be created as an admin or not.
+            displayname: The displayname of the new user.
 
         Returns:
-            The MXID of the new user (unicode).
+            The MXID of the new user.
         """
         self.hs.config.registration_shared_secret = "shared"
 
@@ -494,6 +587,7 @@ class HomeserverTestCase(TestCase):
             {
                 "nonce": nonce,
                 "username": username,
+                "displayname": displayname,
                 "password": password,
                 "admin": admin,
                 "mac": want_mac,
@@ -544,7 +638,7 @@ class HomeserverTestCase(TestCase):
         """
         event_creator = self.hs.get_event_creation_handler()
         secrets = self.hs.get_secrets()
-        requester = Requester(user, None, False, None, None)
+        requester = create_requester(user)
 
         event, context = self.get_success(
             event_creator.create_event(
@@ -562,7 +656,9 @@ class HomeserverTestCase(TestCase):
         if soft_failed:
             event.internal_metadata.soft_failed = True
 
-        self.get_success(event_creator.send_nonmember_event(requester, event, context))
+        self.get_success(
+            event_creator.handle_new_client_event(requester, event, context)
+        )
 
         return event.event_id
 
@@ -571,7 +667,7 @@ class HomeserverTestCase(TestCase):
         Add the given event as an extremity to the room.
         """
         self.get_success(
-            self.hs.get_datastore().db.simple_insert(
+            self.hs.get_datastore().db_pool.simple_insert(
                 table="event_forward_extremities",
                 values={"room_id": room_id, "event_id": event_id},
                 desc="test_add_extremity",
@@ -603,7 +699,9 @@ class HomeserverTestCase(TestCase):
             user: MXID of the user to inject the membership for.
             membership: The membership type.
         """
-        event_injection.inject_member_event(self.hs, room, user, membership)
+        self.get_success(
+            event_injection.inject_member_event(self.hs, room, user, membership)
+        )
 
 
 class FederatingHomeserverTestCase(HomeserverTestCase):
@@ -612,7 +710,7 @@ class FederatingHomeserverTestCase(HomeserverTestCase):
     """
 
     def prepare(self, reactor, clock, homeserver):
-        class Authenticator(object):
+        class Authenticator:
             def authenticate_request(self, request, content):
                 return succeed("other.example.com")
 

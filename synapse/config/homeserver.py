@@ -78,7 +78,6 @@ class HomeServerConfig(RootConfig):
         JWTConfig,
         PasswordConfig,
         EmailConfig,
-        WorkerConfig,
         PasswordAuthProviderConfig,
         PushConfig,
         SpamCheckerConfig,
@@ -91,6 +90,6 @@ class HomeServerConfig(RootConfig):
         RoomDirectoryConfig,
         ThirdPartyRulesConfig,
         TracerConfig,
+        WorkerConfig,
         RedisConfig,
-        FederationConfig,
     ]

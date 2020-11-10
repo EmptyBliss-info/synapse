@@ -13,58 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from hashlib import sha256
-from typing import List, Optional
+from typing import Optional
 
-import attr
 from netaddr import IPSet
 
-from ._base import Config, ConfigError
-
-
-@attr.s
-class ShardedFederationSendingConfig:
-    """Algorithm for choosing which federation sender instance is responsible
-    for which destionation host.
-    """
-
-    instances = attr.ib(type=List[str])
-
-    def should_send_to(self, instance_name: str, destination: str) -> bool:
-        """Whether this instance is responsible for sending transcations for
-        the given host.
-        """
-
-        # If multiple federation senders are not defined we always return true.
-        if not self.instances or len(self.instances) == 1:
-            return True
-
-        # We shard by taking the hash, modulo it by the number of federation
-        # senders and then checking whether this instance matches the instance
-        # at that index.
-        #
-        # (Technically this introduces some bias and is not entirely uniform, but
-        # since the hash is so large the bias is ridiculously small).
-        dest_hash = sha256(destination.encode("utf8")).digest()
-        dest_int = int.from_bytes(dest_hash, byteorder="little")
-        remainder = dest_int % (len(self.instances))
-        return self.instances[remainder] == instance_name
+from synapse.config._base import Config, ConfigError
+from synapse.config._util import validate_config
 
 
 class FederationConfig(Config):
     section = "federation"
 
     def read_config(self, config, **kwargs):
-        # Whether to send federation traffic out in this process. This only
-        # applies to some federation traffic, and so shouldn't be used to
-        # "disable" federation
-        self.send_federation = config.get("send_federation", True)
-
-        federation_sender_instances = config.get("federation_sender_instances") or []
-        self.federation_shard_config = ShardedFederationSendingConfig(
-            federation_sender_instances
-        )
-
         # FIXME: federation_domain_whitelist needs sytests
         self.federation_domain_whitelist = None  # type: Optional[dict]
         federation_domain_whitelist = config.get("federation_domain_whitelist", None)
@@ -93,8 +53,18 @@ class FederationConfig(Config):
                 "Invalid range(s) provided in federation_ip_range_blacklist: %s" % e
             )
 
+        federation_metrics_domains = config.get("federation_metrics_domains") or []
+        validate_config(
+            _METRICS_FOR_DOMAINS_SCHEMA,
+            federation_metrics_domains,
+            ("federation_metrics_domains",),
+        )
+        self.federation_metrics_domains = set(federation_metrics_domains)
+
     def generate_config_section(self, config_dir_path, server_name, **kwargs):
         return """\
+        ## Federation ##
+
         # Restrict federation to the following whitelist of domains.
         # N.B. we recommend also firewalling your federation listener to limit
         # inbound federation traffic as early as possible, rather than relying
@@ -126,4 +96,18 @@ class FederationConfig(Config):
           - '::1/128'
           - 'fe80::/64'
           - 'fc00::/7'
+
+        # Report prometheus metrics on the age of PDUs being sent to and received from
+        # the following domains. This can be used to give an idea of "delay" on inbound
+        # and outbound federation, though be aware that any delay can be due to problems
+        # at either end or with the intermediate network.
+        #
+        # By default, no domains are monitored in this way.
+        #
+        #federation_metrics_domains:
+        #  - matrix.org
+        #  - example.com
         """
+
+
+_METRICS_FOR_DOMAINS_SCHEMA = {"type": "array", "items": {"type": "string"}}

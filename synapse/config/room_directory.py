@@ -99,7 +99,7 @@ class RoomDirectoryConfig(Config):
         #
         # Options for the rules include:
         #
-        #   user_id: Matches agaisnt the creator of the alias
+        #   user_id: Matches against the creator of the alias
         #   room_id: Matches against the room ID being published
         #   alias: Matches against any current local or canonical aliases
         #            associated with the room
@@ -149,7 +149,7 @@ class RoomDirectoryConfig(Config):
         return False
 
 
-class _RoomDirectoryRule(object):
+class _RoomDirectoryRule:
     """Helper class to test whether a room directory action is allowed, like
     creating an alias or publishing a room.
     """

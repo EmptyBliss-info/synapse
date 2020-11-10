@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional
 from synapse.http.servlet import parse_json_object_from_request
 from synapse.replication.http._base import ReplicationEndpoint
 from synapse.types import JsonDict, Requester, UserID
-from synapse.util.distributor import user_joined_room, user_left_room
+from synapse.util.distributor import user_left_room
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -45,14 +45,16 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
     PATH_ARGS = ("room_id", "user_id")
 
     def __init__(self, hs):
-        super(ReplicationRemoteJoinRestServlet, self).__init__(hs)
+        super().__init__(hs)
 
-        self.federation_handler = hs.get_handlers().federation_handler
+        self.federation_handler = hs.get_federation_handler()
         self.store = hs.get_datastore()
         self.clock = hs.get_clock()
 
     @staticmethod
-    def _serialize_payload(requester, room_id, user_id, remote_room_hosts, content):
+    async def _serialize_payload(
+        requester, room_id, user_id, remote_room_hosts, content
+    ):
         """
         Args:
             requester(Requester)
@@ -75,8 +77,7 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
 
         requester = Requester.deserialize(self.store, content["requester"])
 
-        if requester.user:
-            request.authenticated_entity = requester.user.to_string()
+        request.requester = requester
 
         logger.info("remote_join: %s into room: %s", user_id, room_id)
 
@@ -105,14 +106,14 @@ class ReplicationRemoteRejectInviteRestServlet(ReplicationEndpoint):
     PATH_ARGS = ("invite_event_id",)
 
     def __init__(self, hs: "HomeServer"):
-        super(ReplicationRemoteRejectInviteRestServlet, self).__init__(hs)
+        super().__init__(hs)
 
         self.store = hs.get_datastore()
         self.clock = hs.get_clock()
         self.member_handler = hs.get_room_member_handler()
 
     @staticmethod
-    def _serialize_payload(  # type: ignore
+    async def _serialize_payload(  # type: ignore
         invite_event_id: str,
         txn_id: Optional[str],
         requester: Requester,
@@ -140,8 +141,7 @@ class ReplicationRemoteRejectInviteRestServlet(ReplicationEndpoint):
 
         requester = Requester.deserialize(self.store, content["requester"])
 
-        if requester.user:
-            request.authenticated_entity = requester.user.to_string()
+        request.requester = requester
 
         # hopefully we're now on the master, so this won't recurse!
         event_id, stream_id = await self.member_handler.remote_reject_invite(
@@ -166,7 +166,7 @@ class ReplicationUserJoinedLeftRoomRestServlet(ReplicationEndpoint):
     CACHE = False  # No point caching as should return instantly.
 
     def __init__(self, hs):
-        super(ReplicationUserJoinedLeftRoomRestServlet, self).__init__(hs)
+        super().__init__(hs)
 
         self.registeration_handler = hs.get_registration_handler()
         self.store = hs.get_datastore()
@@ -174,14 +174,14 @@ class ReplicationUserJoinedLeftRoomRestServlet(ReplicationEndpoint):
         self.distributor = hs.get_distributor()
 
     @staticmethod
-    def _serialize_payload(room_id, user_id, change):
+    async def _serialize_payload(room_id, user_id, change):
         """
         Args:
             room_id (str)
             user_id (str)
-            change (str): Either "joined" or "left"
+            change (str): "left"
         """
-        assert change in ("joined", "left")
+        assert change == "left"
 
         return {}
 
@@ -190,9 +190,7 @@ class ReplicationUserJoinedLeftRoomRestServlet(ReplicationEndpoint):
 
         user = UserID.from_string(user_id)
 
-        if change == "joined":
-            user_joined_room(self.distributor, user, room_id)
-        elif change == "left":
+        if change == "left":
             user_left_room(self.distributor, user, room_id)
         else:
             raise Exception("Unrecognized change: %r", change)

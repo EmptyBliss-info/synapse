@@ -47,7 +47,7 @@ def check(
     Args:
         room_version_obj: the version of the room
         event: the event being checked.
-        auth_events (dict: event-key -> event): the existing room state.
+        auth_events: the existing room state.
 
     Raises:
         AuthError if the checks fail
@@ -446,6 +446,8 @@ def check_redaction(
 
     if room_version_obj.event_format == EventFormatVersions.V1:
         redacter_domain = get_domain_from_id(event.event_id)
+        if not isinstance(event.redacts, str):
+            return False
         redactee_domain = get_domain_from_id(event.redacts)
         if redacter_domain == redactee_domain:
             return True

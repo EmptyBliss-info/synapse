@@ -172,11 +172,11 @@ from functools import wraps
 from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import attr
-from canonicaljson import json
 
 from twisted.internet import defer
 
 from synapse.config import ConfigError
+from synapse.util import json_decoder, json_encoder
 
 if TYPE_CHECKING:
     from synapse.http.site import SynapseRequest
@@ -185,7 +185,7 @@ if TYPE_CHECKING:
 # Helper class
 
 
-class _DummyTagNames(object):
+class _DummyTagNames:
     """wrapper of opentracings tags. We need to have them if we
     want to reference them without opentracing around. Clearly they
     should never actually show up in a trace. `set_tags` overwrites
@@ -317,7 +317,7 @@ def ensure_active_span(message, ret=None):
 
 
 @contextlib.contextmanager
-def _noop_context_manager(*args, **kwargs):
+def noop_context_manager(*args, **kwargs):
     """Does exactly what it says on the tin"""
     yield
 
@@ -413,7 +413,7 @@ def start_active_span(
     """
 
     if opentracing is None:
-        return _noop_context_manager()
+        return noop_context_manager()
 
     return opentracing.tracer.start_active_span(
         operation_name,
@@ -428,7 +428,7 @@ def start_active_span(
 
 def start_active_span_follows_from(operation_name, contexts):
     if opentracing is None:
-        return _noop_context_manager()
+        return noop_context_manager()
 
     references = [opentracing.follows_from(context) for context in contexts]
     scope = start_active_span(operation_name, references=references)
@@ -459,7 +459,7 @@ def start_active_span_from_request(
     # Also, twisted uses byte arrays while opentracing expects strings.
 
     if opentracing is None:
-        return _noop_context_manager()
+        return noop_context_manager()
 
     header_dict = {
         k.decode(): v[0].decode() for k, v in request.requestHeaders.getAllRawHeaders()
@@ -497,9 +497,11 @@ def start_active_span_from_edu(
     """
 
     if opentracing is None:
-        return _noop_context_manager()
+        return noop_context_manager()
 
-    carrier = json.loads(edu_content.get("context", "{}")).get("opentracing", {})
+    carrier = json_decoder.decode(edu_content.get("context", "{}")).get(
+        "opentracing", {}
+    )
     context = opentracing.tracer.extract(opentracing.Format.TEXT_MAP, carrier)
     _references = [
         opentracing.child_of(span_context_from_string(x))
@@ -507,7 +509,7 @@ def start_active_span_from_edu(
     ]
 
     # For some reason jaeger decided not to support the visualization of multiple parent
-    # spans or explicitely show references. I include the span context as a tag here as
+    # spans or explicitly show references. I include the span context as a tag here as
     # an aid to people debugging but it's really not an ideal solution.
 
     references += _references
@@ -690,7 +692,7 @@ def active_span_context_as_string():
         opentracing.tracer.inject(
             opentracing.tracer.active_span, opentracing.Format.TEXT_MAP, carrier
         )
-    return json.dumps(carrier)
+    return json_encoder.encode(carrier)
 
 
 @only_if_tracing
@@ -699,7 +701,7 @@ def span_context_from_string(carrier):
     Returns:
         The active span context decoded from a string.
     """
-    carrier = json.loads(carrier)
+    carrier = json_decoder.decode(carrier)
     return opentracing.tracer.extract(opentracing.Format.TEXT_MAP, carrier)
 
 
@@ -733,37 +735,43 @@ def trace(func=None, opname=None):
 
         _opname = opname if opname else func.__name__
 
-        @wraps(func)
-        def _trace_inner(*args, **kwargs):
-            if opentracing is None:
-                return func(*args, **kwargs)
+        if inspect.iscoroutinefunction(func):
 
-            scope = start_active_span(_opname)
-            scope.__enter__()
+            @wraps(func)
+            async def _trace_inner(*args, **kwargs):
+                with start_active_span(_opname):
+                    return await func(*args, **kwargs)
 
-            try:
-                result = func(*args, **kwargs)
-                if isinstance(result, defer.Deferred):
+        else:
+            # The other case here handles both sync functions and those
+            # decorated with inlineDeferred.
+            @wraps(func)
+            def _trace_inner(*args, **kwargs):
+                scope = start_active_span(_opname)
+                scope.__enter__()
 
-                    def call_back(result):
+                try:
+                    result = func(*args, **kwargs)
+                    if isinstance(result, defer.Deferred):
+
+                        def call_back(result):
+                            scope.__exit__(None, None, None)
+                            return result
+
+                        def err_back(result):
+                            scope.__exit__(None, None, None)
+                            return result
+
+                        result.addCallbacks(call_back, err_back)
+
+                    else:
                         scope.__exit__(None, None, None)
-                        return result
 
-                    def err_back(result):
-                        scope.span.set_tag(tags.ERROR, True)
-                        scope.__exit__(None, None, None)
-                        return result
+                    return result
 
-                    result.addCallbacks(call_back, err_back)
-
-                else:
-                    scope.__exit__(None, None, None)
-
-                return result
-
-            except Exception as e:
-                scope.__exit__(type(e), None, e.__traceback__)
-                raise
+                except Exception as e:
+                    scope.__exit__(type(e), None, e.__traceback__)
+                    raise
 
         return _trace_inner
 

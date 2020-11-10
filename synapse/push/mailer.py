@@ -16,8 +16,7 @@
 import email.mime.multipart
 import email.utils
 import logging
-import time
-import urllib
+import urllib.parse
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Iterable, List, TypeVar
@@ -25,8 +24,9 @@ from typing import Iterable, List, TypeVar
 import bleach
 import jinja2
 
-from synapse.api.constants import EventTypes
+from synapse.api.constants import EventTypes, Membership
 from synapse.api.errors import StoreError
+from synapse.config.emailconfig import EmailSubjectConfig
 from synapse.logging.context import make_deferred_yieldable
 from synapse.push.presentable_names import (
     calculate_room_name,
@@ -41,23 +41,6 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-
-MESSAGE_FROM_PERSON_IN_ROOM = (
-    "You have a message on %(app)s from %(person)s in the %(room)s room..."
-)
-MESSAGE_FROM_PERSON = "You have a message on %(app)s from %(person)s..."
-MESSAGES_FROM_PERSON = "You have messages on %(app)s from %(person)s..."
-MESSAGES_IN_ROOM = "You have messages on %(app)s in the %(room)s room..."
-MESSAGES_IN_ROOM_AND_OTHERS = (
-    "You have messages on %(app)s in the %(room)s room and others..."
-)
-MESSAGES_FROM_PERSON_AND_OTHERS = (
-    "You have messages on %(app)s from %(person)s and others..."
-)
-INVITE_FROM_PERSON_TO_ROOM = (
-    "%(person)s has invited you to join the %(room)s room on %(app)s..."
-)
-INVITE_FROM_PERSON = "%(person)s has invited you to chat on %(app)s..."
 
 CONTEXT_BEFORE = 1
 CONTEXT_AFTER = 1
@@ -109,7 +92,7 @@ ALLOWED_ATTRS = {
 # ALLOWED_SCHEMES = ["http", "https", "ftp", "mailto"]
 
 
-class Mailer(object):
+class Mailer:
     def __init__(self, hs, app_name, template_html, template_text):
         self.hs = hs
         self.template_html = template_html
@@ -121,6 +104,7 @@ class Mailer(object):
         self.state_handler = self.hs.get_state_handler()
         self.storage = hs.get_storage()
         self.app_name = app_name
+        self.email_subjects = hs.config.email_subjects  # type: EmailSubjectConfig
 
         logger.info("Created Mailer for app_name %s" % app_name)
 
@@ -139,7 +123,7 @@ class Mailer(object):
         params = {"token": token, "client_secret": client_secret, "sid": sid}
         link = (
             self.hs.config.public_baseurl
-            + "_matrix/client/unstable/password_reset/email/submit_token?%s"
+            + "_synapse/client/password_reset/email/submit_token?%s"
             % urllib.parse.urlencode(params)
         )
 
@@ -147,7 +131,8 @@ class Mailer(object):
 
         await self.send_email(
             email_address,
-            "[%s] Password Reset" % self.hs.config.server_name,
+            self.email_subjects.password_reset
+            % {"server_name": self.hs.config.server_name},
             template_vars,
         )
 
@@ -174,7 +159,8 @@ class Mailer(object):
 
         await self.send_email(
             email_address,
-            "[%s] Register your Email Address" % self.hs.config.server_name,
+            self.email_subjects.email_validation
+            % {"server_name": self.hs.config.server_name},
             template_vars,
         )
 
@@ -202,7 +188,8 @@ class Mailer(object):
 
         await self.send_email(
             email_address,
-            "[%s] Validate Your Email" % self.hs.config.server_name,
+            self.email_subjects.email_validation
+            % {"server_name": self.hs.config.server_name},
             template_vars,
         )
 
@@ -269,16 +256,13 @@ class Mailer(object):
                 user_id, app_id, email_address
             ),
             "summary_text": summary_text,
-            "app_name": self.app_name,
             "rooms": rooms,
             "reason": reason,
         }
 
-        await self.send_email(
-            email_address, "[%s] %s" % (self.app_name, summary_text), template_vars
-        )
+        await self.send_email(email_address, summary_text, template_vars)
 
-    async def send_email(self, email_address, subject, template_vars):
+    async def send_email(self, email_address, subject, extra_template_vars):
         """Send an email with the given information and template text"""
         try:
             from_string = self.hs.config.email_notif_from % {"app": self.app_name}
@@ -290,6 +274,13 @@ class Mailer(object):
 
         if raw_to == "":
             raise RuntimeError("Invalid 'to' address")
+
+        template_vars = {
+            "app_name": self.app_name,
+            "server_name": self.hs.config.server.server_name,
+        }
+
+        template_vars.update(extra_template_vars)
 
         html_text = self.template_html.render(**template_vars)
         html_part = MIMEText(html_text, "html", "utf8")
@@ -326,9 +317,14 @@ class Mailer(object):
     async def get_room_vars(
         self, room_id, user_id, notifs, notif_events, room_state_ids
     ):
-        my_member_event_id = room_state_ids[("m.room.member", user_id)]
-        my_member_event = await self.store.get_event(my_member_event_id)
-        is_invite = my_member_event.content["membership"] == "invite"
+        # Check if one of the notifs is an invite event for the user.
+        is_invite = False
+        for n in notifs:
+            ev = notif_events[n["event_id"]]
+            if ev.type == EventTypes.Member and ev.state_key == user_id:
+                if ev.content.get("membership") == Membership.INVITE:
+                    is_invite = True
+                    break
 
         room_name = await calculate_room_name(self.store, room_state_ids, user_id)
 
@@ -396,8 +392,8 @@ class Mailer(object):
         return ret
 
     async def get_message_vars(self, notif, event, room_state_ids):
-        if event.type != EventTypes.Message:
-            return
+        if event.type != EventTypes.Message and event.type != EventTypes.Encrypted:
+            return None
 
         sender_state_event_id = room_state_ids[("m.room.member", event.sender)]
         sender_state_event = await self.store.get_event(sender_state_event_id)
@@ -408,10 +404,8 @@ class Mailer(object):
         # sender_hash % the number of default images to choose from
         sender_hash = string_ordinal_total(event.sender)
 
-        msgtype = event.content.get("msgtype")
-
         ret = {
-            "msgtype": msgtype,
+            "event_type": event.type,
             "is_historical": event.event_id != notif["event_id"],
             "id": event.event_id,
             "ts": event.origin_server_ts,
@@ -419,6 +413,14 @@ class Mailer(object):
             "sender_avatar_url": sender_avatar_url,
             "sender_hash": sender_hash,
         }
+
+        # Encrypted messages don't have any additional useful information.
+        if event.type == EventTypes.Encrypted:
+            return ret
+
+        msgtype = event.content.get("msgtype")
+
+        ret["msgtype"] = msgtype
 
         if msgtype == "m.text":
             self.add_text_message_vars(ret, event)
@@ -464,24 +466,34 @@ class Mailer(object):
                 self.store, room_state_ids[room_id], user_id, fallback_to_members=False
             )
 
-            my_member_event_id = room_state_ids[room_id][("m.room.member", user_id)]
-            my_member_event = await self.store.get_event(my_member_event_id)
-            if my_member_event.content["membership"] == "invite":
-                inviter_member_event_id = room_state_ids[room_id][
-                    ("m.room.member", my_member_event.sender)
-                ]
-                inviter_member_event = await self.store.get_event(
-                    inviter_member_event_id
+            # See if one of the notifs is an invite event for the user
+            invite_event = None
+            for n in notifs_by_room[room_id]:
+                ev = notif_events[n["event_id"]]
+                if ev.type == EventTypes.Member and ev.state_key == user_id:
+                    if ev.content.get("membership") == Membership.INVITE:
+                        invite_event = ev
+                        break
+
+            if invite_event:
+                inviter_member_event_id = room_state_ids[room_id].get(
+                    ("m.room.member", invite_event.sender)
                 )
-                inviter_name = name_from_member_event(inviter_member_event)
+                inviter_name = invite_event.sender
+                if inviter_member_event_id:
+                    inviter_member_event = await self.store.get_event(
+                        inviter_member_event_id, allow_none=True
+                    )
+                    if inviter_member_event:
+                        inviter_name = name_from_member_event(inviter_member_event)
 
                 if room_name is None:
-                    return INVITE_FROM_PERSON % {
+                    return self.email_subjects.invite_from_person % {
                         "person": inviter_name,
                         "app": self.app_name,
                     }
                 else:
-                    return INVITE_FROM_PERSON_TO_ROOM % {
+                    return self.email_subjects.invite_from_person_to_room % {
                         "person": inviter_name,
                         "room": room_name,
                         "app": self.app_name,
@@ -499,13 +511,13 @@ class Mailer(object):
                     sender_name = name_from_member_event(state_event)
 
                 if sender_name is not None and room_name is not None:
-                    return MESSAGE_FROM_PERSON_IN_ROOM % {
+                    return self.email_subjects.message_from_person_in_room % {
                         "person": sender_name,
                         "room": room_name,
                         "app": self.app_name,
                     }
                 elif sender_name is not None:
-                    return MESSAGE_FROM_PERSON % {
+                    return self.email_subjects.message_from_person % {
                         "person": sender_name,
                         "app": self.app_name,
                     }
@@ -513,7 +525,10 @@ class Mailer(object):
                 # There's more than one notification for this room, so just
                 # say there are several
                 if room_name is not None:
-                    return MESSAGES_IN_ROOM % {"room": room_name, "app": self.app_name}
+                    return self.email_subjects.messages_in_room % {
+                        "room": room_name,
+                        "app": self.app_name,
+                    }
                 else:
                     # If the room doesn't have a name, say who the messages
                     # are from explicitly to avoid, "messages in the Bob room"
@@ -531,7 +546,7 @@ class Mailer(object):
                         ]
                     )
 
-                    return MESSAGES_FROM_PERSON % {
+                    return self.email_subjects.messages_from_person % {
                         "person": descriptor_from_member_events(member_events.values()),
                         "app": self.app_name,
                     }
@@ -540,7 +555,7 @@ class Mailer(object):
 
             # ...but we still refer to the 'reason' room which triggered the mail
             if reason["room_name"] is not None:
-                return MESSAGES_IN_ROOM_AND_OTHERS % {
+                return self.email_subjects.messages_in_room_and_others % {
                     "room": reason["room_name"],
                     "app": self.app_name,
                 }
@@ -560,7 +575,7 @@ class Mailer(object):
                     [room_state_ids[room_id][("m.room.member", s)] for s in sender_ids]
                 )
 
-                return MESSAGES_FROM_PERSON_AND_OTHERS % {
+                return self.email_subjects.messages_from_person_and_others % {
                     "person": descriptor_from_member_events(member_events.values()),
                     "app": self.app_name,
                 }
@@ -645,72 +660,3 @@ def string_ordinal_total(s):
     for c in s:
         tot += ord(c)
     return tot
-
-
-def format_ts_filter(value, format):
-    return time.strftime(format, time.localtime(value / 1000))
-
-
-def load_jinja2_templates(
-    template_dir,
-    template_filenames,
-    apply_format_ts_filter=False,
-    apply_mxc_to_http_filter=False,
-    public_baseurl=None,
-):
-    """Loads and returns one or more jinja2 templates and applies optional filters
-
-    Args:
-        template_dir (str): The directory where templates are stored
-        template_filenames (list[str]): A list of template filenames
-        apply_format_ts_filter (bool): Whether to apply a template filter that formats
-            timestamps
-        apply_mxc_to_http_filter (bool): Whether to apply a template filter that converts
-            mxc urls to http urls
-        public_baseurl (str|None): The public baseurl of the server. Required for
-            apply_mxc_to_http_filter to be enabled
-
-    Returns:
-        A list of jinja2 templates corresponding to the given list of filenames,
-        with order preserved
-    """
-    logger.info(
-        "loading email templates %s from '%s'", template_filenames, template_dir
-    )
-    loader = jinja2.FileSystemLoader(template_dir)
-    env = jinja2.Environment(loader=loader)
-
-    if apply_format_ts_filter:
-        env.filters["format_ts"] = format_ts_filter
-
-    if apply_mxc_to_http_filter and public_baseurl:
-        env.filters["mxc_to_http"] = _create_mxc_to_http_filter(public_baseurl)
-
-    templates = []
-    for template_filename in template_filenames:
-        template = env.get_template(template_filename)
-        templates.append(template)
-
-    return templates
-
-
-def _create_mxc_to_http_filter(public_baseurl):
-    def mxc_to_http_filter(value, width, height, resize_method="crop"):
-        if value[0:6] != "mxc://":
-            return ""
-
-        serverAndMediaId = value[6:]
-        fragment = None
-        if "#" in serverAndMediaId:
-            (serverAndMediaId, fragment) = serverAndMediaId.split("#", 1)
-            fragment = "#" + fragment
-
-        params = {"width": width, "height": height, "method": resize_method}
-        return "%s_matrix/media/v1/thumbnail/%s?%s%s" % (
-            public_baseurl,
-            serverAndMediaId,
-            urllib.parse.urlencode(params),
-            fragment or "",
-        )
-
-    return mxc_to_http_filter

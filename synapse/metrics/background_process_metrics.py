@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import logging
 import threading
-from asyncio import iscoroutine
 from functools import wraps
 from typing import TYPE_CHECKING, Dict, Optional, Set
 
 from prometheus_client.core import REGISTRY, Counter, Gauge
 
 from twisted.internet import defer
-from twisted.python.failure import Failure
 
 from synapse.logging.context import LoggingContext, PreserveLoggingContext
+from synapse.logging.opentracing import noop_context_manager, start_active_span
 
 if TYPE_CHECKING:
     import resource
@@ -106,7 +106,7 @@ _background_processes_active_since_last_scrape = set()  # type: Set[_BackgroundP
 _bg_metrics_lock = threading.Lock()
 
 
-class _Collector(object):
+class _Collector:
     """A custom metrics collector for the background process metrics.
 
     Ensures that all of the metrics are up-to-date with any in-flight processes
@@ -141,7 +141,7 @@ class _Collector(object):
 REGISTRY.register(_Collector())
 
 
-class _BackgroundProcess(object):
+class _BackgroundProcess:
     def __init__(self, desc, ctx):
         self.desc = desc
         self._context = ctx
@@ -167,7 +167,7 @@ class _BackgroundProcess(object):
         )
 
 
-def run_as_background_process(desc, func, *args, **kwargs):
+def run_as_background_process(desc: str, func, *args, bg_start_span=True, **kwargs):
     """Run the given function in its own logcontext, with resource metrics
 
     This should be used to wrap processes which are fired off to run in the
@@ -176,11 +176,14 @@ def run_as_background_process(desc, func, *args, **kwargs):
     It returns a Deferred which completes when the function completes, but it doesn't
     follow the synapse logcontext rules, which makes it appropriate for passing to
     clock.looping_call and friends (or for firing-and-forgetting in the middle of a
-    normal synapse inlineCallbacks function).
+    normal synapse async function).
 
     Args:
-        desc (str): a description for this background process type
+        desc: a description for this background process type
         func: a function, which may return a Deferred or a coroutine
+        bg_start_span: Whether to start an opentracing span. Defaults to True.
+            Should only be disabled for processes that will not log to or tag
+            a span.
         args: positional args for func
         kwargs: keyword args for func
 
@@ -188,8 +191,7 @@ def run_as_background_process(desc, func, *args, **kwargs):
         follow the synapse logcontext rules.
     """
 
-    @defer.inlineCallbacks
-    def run():
+    async def run():
         with _bg_metrics_lock:
             count = _background_process_counts.get(desc, 0)
             _background_process_counts[desc] = count + 1
@@ -199,33 +201,28 @@ def run_as_background_process(desc, func, *args, **kwargs):
 
         with BackgroundProcessLoggingContext(desc) as context:
             context.request = "%s-%i" % (desc, count)
-
             try:
-                result = func(*args, **kwargs)
+                ctx = noop_context_manager()
+                if bg_start_span:
+                    ctx = start_active_span(desc, tags={"request_id": context.request})
+                with ctx:
+                    result = func(*args, **kwargs)
 
-                # We probably don't have an ensureDeferred in our call stack to handle
-                # coroutine results, so we need to ensureDeferred here.
-                #
-                # But we need this check because ensureDeferred doesn't like being
-                # called on immediate values (as opposed to Deferreds or coroutines).
-                if iscoroutine(result):
-                    result = defer.ensureDeferred(result)
+                    if inspect.isawaitable(result):
+                        result = await result
 
-                return (yield result)
+                    return result
             except Exception:
-                # failure.Failure() fishes the original Failure out of our stack, and
-                # thus gives us a sensible stack trace.
-                f = Failure()
-                logger.error(
-                    "Background process '%s' threw an exception",
-                    desc,
-                    exc_info=(f.type, f.value, f.getTracebackObject()),
+                logger.exception(
+                    "Background process '%s' threw an exception", desc,
                 )
             finally:
                 _background_process_in_flight_count.labels(desc).dec()
 
     with PreserveLoggingContext():
-        return run()
+        # Note that we return a Deferred here so that it can be used in a
+        # looping_call and other places that expect a Deferred.
+        return defer.ensureDeferred(run())
 
 
 def wrap_as_background_process(desc):
@@ -275,7 +272,7 @@ class BackgroundProcessLoggingContext(LoggingContext):
 
         super().__exit__(type, value, traceback)
 
-        # The background process has finished. We explictly remove and manually
+        # The background process has finished. We explicitly remove and manually
         # update the metrics here so that if nothing is scraping metrics the set
         # doesn't infinitely grow.
         with _bg_metrics_lock:
